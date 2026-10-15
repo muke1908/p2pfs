@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.partial
+.p2pfs/
+coverage/
+.playwright-cli/
+/rcv/
+/dnl/
