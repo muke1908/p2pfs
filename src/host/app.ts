@@ -2,7 +2,7 @@ import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import { readFile } from 'node:fs/promises';
 import { timingSafeEqual } from 'node:crypto';
 import type { Readable } from 'node:stream';
-import { StateStore, type Provider } from '../config/state.js';
+import { StateStore } from '../config/state.js';
 import { AppError, Sessions, digest } from '../security/auth.js';
 import { Transport, tunnelHosts, publicUrl } from '../security/transport.js';
 import { Shares } from '../shares/service.js';
@@ -156,13 +156,14 @@ export class Host {
     }
   }
 
-  async startTunnel(provider = this.store.state.provider): Promise<void> {
+  async startTunnel(): Promise<void> {
     if (this.options.publicUrl)
       throw new AppError(409, 'This host uses an externally managed tunnel.');
     if (this.closing) throw new AppError(409, 'Host is stopping.');
-    this.store.state.provider = provider;
-    await this.store.save();
-    await this.tunnel.start(provider, Number(new URL(this.transferUrl).port));
+    await this.tunnel.start(
+      this.store.state.provider,
+      Number(new URL(this.transferUrl).port),
+    );
   }
 
   async close(): Promise<void> {
@@ -200,7 +201,6 @@ export class Host {
       guestLinks: this.guestLinks.list(),
       guestOrigin: this.guestOrigin(),
       tunnel: {
-        provider: this.store.state.provider,
         status: this.options.publicUrl
           ? 'Externally managed'
           : this.tunnel.status,
@@ -406,23 +406,15 @@ export class Host {
         return { ok: true };
       },
     );
-    this.management.post<{ Body: { provider: Provider } }>(
+    this.management.post(
       '/api/tunnel/start',
       {
         schema: {
-          body: bodySchema(
-            {
-              provider: {
-                type: 'string',
-                enum: ['devtunnel', 'ngrok', 'zrok'],
-              },
-            },
-            ['provider'],
-          ),
+          body: bodySchema({}, []),
         },
       },
-      async (request) => {
-        await this.startTunnel(request.body.provider);
+      async () => {
+        await this.startTunnel();
         return { ok: true };
       },
     );

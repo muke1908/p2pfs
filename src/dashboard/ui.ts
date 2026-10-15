@@ -16,7 +16,7 @@ interface DashboardState {
   whitepad: SharedWhitepad;
   guestLinks: GuestLinkSummary[];
   guestOrigin?: string;
-  tunnel: { provider: string; status: string; url?: string; external: boolean };
+  tunnel: { status: string; url?: string; external: boolean };
   warnings: string[];
 }
 interface LocalListing {
@@ -495,8 +495,6 @@ function renderConnection(): void {
   element('external-tunnel-note').hidden = !state.tunnel.external;
   element('managed-tunnel-controls').hidden = state.tunnel.external;
   text('tunnel-status', state.tunnel.status);
-  if (!dialog('connection-dialog').open)
-    element<HTMLSelectElement>('provider').value = state.tunnel.provider;
   const url = element<HTMLAnchorElement>('tunnel-url');
   url.hidden = !state.tunnel.url;
   url.textContent = state.tunnel.url ?? '';
@@ -815,8 +813,6 @@ for (const id of ['logout', 'top-lock'])
 onClick('connections', async () => {
   text('connection-error', '');
   text('connection-feedback', '');
-  if (state)
-    element<HTMLSelectElement>('provider').value = state.tunnel.provider;
   renderConnection();
   dialog('connection-dialog').showModal();
 });
@@ -830,12 +826,10 @@ onClick(
   async () => {
     text(
       'connection-feedback',
-      'Starting provider CLI. This can take a moment…',
+      'Starting the connection. This can take a moment…',
     );
     try {
-      await api('/tunnel/start', 'POST', {
-        provider: element<HTMLSelectElement>('provider').value,
-      });
+      await api('/tunnel/start', 'POST', {});
       text(
         'connection-feedback',
         'Tunnel started. Your selected shares are reachable.',

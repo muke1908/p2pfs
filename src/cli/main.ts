@@ -2,12 +2,7 @@
 import { Command, InvalidArgumentError } from 'commander';
 import { open, readFile, rm, mkdir } from 'node:fs/promises';
 import path from 'node:path';
-import {
-  StateStore,
-  defaultStateDir,
-  isMissing,
-  type Provider,
-} from '../config/state.js';
+import { StateStore, defaultStateDir, isMissing } from '../config/state.js';
 import { Host } from '../host/app.js';
 import { AppError } from '../security/auth.js';
 import { publicUrl, Transport } from '../security/transport.js';
@@ -15,7 +10,6 @@ import { publicUrl, Transport } from '../security/transport.js';
 interface StartOptions {
   stateDir: string;
   name?: string;
-  provider?: Provider;
   transferPort?: number;
   managementPort: number;
   passwordStdin?: boolean;
@@ -122,11 +116,6 @@ async function acquireLock(directory: string): Promise<() => Promise<void>> {
 }
 
 async function start(options: StartOptions): Promise<void> {
-  if (
-    options.provider &&
-    !['devtunnel', 'ngrok', 'zrok'].includes(options.provider)
-  )
-    throw new Error('Provider must be devtunnel, ngrok, or zrok.');
   if (options.publicUrl) publicUrl(options.publicUrl);
   const password = await passwordFromInput(Boolean(options.passwordStdin));
   const directory = path.resolve(options.stateDir);
@@ -136,7 +125,6 @@ async function start(options: StartOptions): Promise<void> {
   try {
     const initial: Parameters<typeof StateStore.open>[2] = {};
     if (options.name) initial.name = options.name;
-    if (options.provider) initial.provider = options.provider;
     if (options.allowHost || options.publicUrl) {
       initial.allowedHosts = [
         ...(options.allowHost ?? []),
@@ -146,6 +134,9 @@ async function start(options: StartOptions): Promise<void> {
         throw new Error('Allowed hosts must be lowercase DNS hostnames.');
     }
     const store = await StateStore.open(directory, password, initial);
+    console.log(
+      `Host configuration: ${path.join(directory, 'host.json')} (edit and restart to change provider)`,
+    );
     host = new Host(store, {
       managementPort: options.managementPort,
       transferPort: options.transferPort,
@@ -235,7 +226,6 @@ const cli = new Command()
     start(current.opts<StartOptions>()),
   );
 cli
-  .option('--provider <provider>', 'devtunnel, ngrok, or zrok')
   .option('--transfer-port <port>', 'Loopback transfer port', port, 7331)
   .option('--no-tunnel', 'Start locally without launching a public tunnel')
   .option(

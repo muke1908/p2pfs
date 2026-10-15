@@ -46,6 +46,48 @@ export function defaultStateDir(): string {
   return path.join(base, 'p2pfs');
 }
 
+async function configuredProvider(
+  directory: string,
+  previous: Provider,
+): Promise<Provider> {
+  const filename = path.join(directory, 'host.json');
+  try {
+    await writeFile(
+      filename,
+      `${JSON.stringify({ provider: previous }, null, 2)}\n`,
+      {
+        mode: 0o600,
+        flag: 'wx',
+      },
+    );
+  } catch (error) {
+    if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST'))
+      throw error;
+  }
+  let config: unknown;
+  try {
+    config = JSON.parse(await readFile(filename, 'utf8'));
+  } catch (error) {
+    throw new Error(
+      `Cannot read host configuration ${filename}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (
+    !config ||
+    typeof config !== 'object' ||
+    Array.isArray(config) ||
+    Object.keys(config).length !== 1 ||
+    !('provider' in config) ||
+    (config.provider !== 'devtunnel' &&
+      config.provider !== 'ngrok' &&
+      config.provider !== 'zrok')
+  )
+    throw new Error(
+      `Invalid host configuration ${filename}: use an object with only "provider" set to "ngrok", "devtunnel", or "zrok".`,
+    );
+  return config.provider;
+}
+
 export class StateStore {
   private tail: Promise<void> = Promise.resolve();
   constructor(
@@ -56,7 +98,7 @@ export class StateStore {
   static async open(
     directory: string,
     password: string,
-    initial: Partial<Pick<State, 'name' | 'provider' | 'allowedHosts'>> = {},
+    initial: Partial<Pick<State, 'name' | 'allowedHosts'>> = {},
   ): Promise<StateStore> {
     await mkdir(directory, { recursive: true, mode: 0o700 });
     await chmod(directory, 0o700);
@@ -93,6 +135,7 @@ export class StateStore {
         provider: 'ngrok',
       };
     }
+    state.provider = await configuredProvider(directory, state.provider);
     Object.assign(state, initial);
     const store = new StateStore(directory, state);
     await store.save();

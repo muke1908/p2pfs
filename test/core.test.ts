@@ -1253,6 +1253,69 @@ test('state rejects wrong passwords and preserves configuration across restart',
   }
 });
 
+test('host configuration controls provider selection and rejects invalid edits without rewriting state', async () => {
+  const f = await fixture();
+  try {
+    await f.host.close();
+    const config = path.join(f.store.directory, 'host.json');
+    assert.deepEqual(JSON.parse(await readFile(config, 'utf8')), {
+      provider: 'ngrok',
+    });
+    await writeFile(config, '{"provider":"devtunnel"}\n');
+    const reopened = await StateStore.open(f.store.directory, password);
+    assert.equal(reopened.state.provider, 'devtunnel');
+    assert.equal(await readFile(config, 'utf8'), '{"provider":"devtunnel"}\n');
+    const stateFile = path.join(f.store.directory, 'state.json');
+    const saved = await readFile(stateFile, 'utf8');
+    for (const invalid of [
+      '{',
+      '{}',
+      '{"provider":"unknown"}',
+      '{"provider":["ngrok"]}',
+      '{"provider":"zrok","typo":true}',
+    ]) {
+      await writeFile(config, invalid);
+      await assert.rejects(
+        StateStore.open(f.store.directory, password),
+        /host configuration/,
+      );
+      assert.equal(await readFile(config, 'utf8'), invalid);
+      assert.equal(await readFile(stateFile, 'utf8'), saved);
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+test('dashboard starts only the configured provider and cannot override it', async () => {
+  const f = await fixture();
+  try {
+    const calls: unknown[] = [];
+    f.host.tunnel.start = async (provider, port) => {
+      calls.push([provider, port]);
+      return 'https://synthetic.example.org';
+    };
+    assert.equal(
+      (await local(f.host, '/api/tunnel/start', 'POST', { provider: 'zrok' }))
+        .status,
+      400,
+    );
+    assert.deepEqual(calls, []);
+    assert.equal(
+      (await local(f.host, '/api/tunnel/start', 'POST', {})).status,
+      200,
+    );
+    assert.deepEqual(calls, [
+      ['ngrok', Number(new URL(f.host.transferUrl).port)],
+    ]);
+    const html = await (await fetch(f.host.managementUrl)).text();
+    assert.equal(html.includes('id="provider"'), false);
+    assert.equal(html.includes('<option'), false);
+  } finally {
+    await f.close();
+  }
+});
+
 test('legacy state migrates without losing content, link restrictions or unrelated files', async () => {
   const f = await fixture();
   let restored: Host | undefined;
@@ -1311,16 +1374,26 @@ test('legacy state migrates without losing content, link restrictions or unrelat
     const stateFile = path.join(f.store.directory, 'state.json');
     const contents = JSON.stringify(previous);
     await writeFile(stateFile, contents);
+    await rm(path.join(f.store.directory, 'host.json'));
     await assert.rejects(
       StateStore.open(f.store.directory, 'wrong-password'),
       /does not match/,
     );
     assert.equal(await readFile(stateFile, 'utf8'), contents);
+    await assert.rejects(readFile(path.join(f.store.directory, 'host.json')), {
+      code: 'ENOENT',
+    });
     const store = await StateStore.open(f.store.directory, password);
     assert.equal(store.state.version, 3);
     assert.equal(store.state.id, previous.id);
     assert.equal(store.state.verifier, previous.verifier);
     assert.equal(store.state.provider, 'zrok');
+    assert.deepEqual(
+      JSON.parse(
+        await readFile(path.join(f.store.directory, 'host.json'), 'utf8'),
+      ),
+      { provider: 'zrok' },
+    );
     assert.deepEqual(store.state.allowedHosts, previous.allowedHosts);
     assert.deepEqual(store.state.shares, previous.shares);
     assert.equal(

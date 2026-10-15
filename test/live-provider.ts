@@ -1,4 +1,4 @@
-import { mkdtemp, realpath, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, realpath, writeFile, rm, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import assert from 'node:assert/strict';
@@ -11,10 +11,16 @@ if (!['devtunnel', 'ngrok', 'zrok'].includes(provider))
 const root = await realpath(
   await mkdtemp(path.join(os.tmpdir(), 'p2pfs-live-')),
 );
+const directory = path.join(root, 'host');
+await mkdir(directory);
+await writeFile(
+  path.join(directory, 'host.json'),
+  JSON.stringify({ provider }),
+);
 const store = await StateStore.open(
-  path.join(root, 'host'),
+  directory,
   'synthetic-provider-smoke-password',
-  { name: 'synthetic-source', provider },
+  { name: 'synthetic-source' },
 );
 const host = new Host(store, { transferPort: 0, managementPort: 0 });
 try {
@@ -23,7 +29,7 @@ try {
   const content = 'Synthetic p2pfs public transfer test. No user data.\n';
   await writeFile(file, content);
   const shareId = await host.shares.add(file);
-  await host.startTunnel(provider);
+  await host.startTunnel();
   assert.equal(host.tunnel.status, 'Ready');
   const origin = host.tunnel.url!;
   const request = (route: string, options: RequestInit = {}) =>

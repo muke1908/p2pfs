@@ -198,6 +198,15 @@ test('publisher CLI starts without registry setup and rejects removed commands',
   const root = await realpath(
     await mkdtemp(path.join(os.tmpdir(), 'p2pfs-cli-')),
   );
+  await assert.rejects(
+    promisify(execFile)(process.execPath, [
+      'dist/src/cli/main.js',
+      '--provider',
+      'ngrok',
+    ]),
+    /unknown option/,
+  );
+  await writeFile(path.join(root, 'host.json'), '{"provider":"devtunnel"}\n');
   const managementPort = await availablePort();
   let transferPort = await availablePort();
   while (transferPort === managementPort) transferPort = await availablePort();
@@ -246,7 +255,15 @@ test('publisher CLI starts without registry setup and rejects removed commands',
     });
     const local = await management(`http://127.0.0.1:${managementPort}`);
     const state = await (await local('/api/state')).json();
-    assert.equal(state.tunnel.provider, 'ngrok');
+    assert.equal(state.tunnel.provider, undefined);
+    assert.ok(
+      output.includes(`Host configuration: ${path.join(root, 'host.json')}`),
+    );
+    assert.equal(
+      JSON.parse(await readFile(path.join(root, 'state.json'), 'utf8'))
+        .provider,
+      'devtunnel',
+    );
     assert.equal(state.guestOrigin, undefined);
     assert.equal(
       (await local('/api/guest-links', 'POST', { label: 'Not public yet' }))

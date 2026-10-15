@@ -57,17 +57,40 @@ Enter a **host password of at least 12 characters** at the hidden prompt. This
 password protects local management; do not send it to recipients.
 
 The command builds the app, starts the local server, and starts the configured
-tunnel. ngrok is the default for a new installation; subsequent starts reuse
-the saved provider. Open the printed **local dashboard URL** and unlock it with
+tunnel. Provider selection lives in the host's **`host.json`** configuration
+file, not in the dashboard. Open the printed **local dashboard URL** and unlock it with
 the host password. Keep the terminal running; **Ctrl+C** shuts down the host and
 its app-owned tunnel.
 
-To choose another provider:
+### Configure the host
+
+The first start creates `host.json` inside the state directory and prints its
+full path. New installations default to ngrok; existing installations keep
+their previously selected provider. To configure before launching a tunnel,
+start once with `npm run publisher -- --no-tunnel`, then stop the host.
+
+Edit `host.json` to select your provider:
+
+```json
+{
+  "provider": "ngrok"
+}
+```
+
+Allowed values are `ngrok`, `devtunnel`, and `zrok`. **Restart the publisher**
+after editing. The file is read at startup; dashboard start/stop buttons use
+that configuration and cannot change it. Invalid configuration stops startup
+with an error rather than silently choosing another provider.
+
+To keep the configuration at a location you choose:
 
 ```sh
-npm run publisher -- --provider devtunnel
-npm run publisher -- --provider zrok
+npm run publisher -- --state-dir ./host-state --no-tunnel
 ```
+
+This creates `./host-state/host.json` alongside private runtime state. Do not
+commit that directory. Keep provider credentials in the provider's own CLI
+configuration, not in `host.json`. The former `--provider` flag is removed.
 
 If tunnel startup fails, the local dashboard stays available. Check the error,
 fix the provider login/configuration/quota, and retry in **Connection settings**.
@@ -179,7 +202,6 @@ The public-content listener and management dashboard both bind to loopback:
 | ------------------- | -------------------------------------- | ------------------------------------------------- |
 | `--transfer-port`   | `7331`                                 | Read-only content behind the tunnel               |
 | `--management-port` | `7332`                                 | Local host dashboard; never forward this port     |
-| `--provider`        | Saved provider, initially `ngrok`      | `ngrok`, `devtunnel`, or `zrok`                   |
 | `--state-dir`       | Per-user OS application-data directory | Publisher settings and shared-content definitions |
 | `--name`            | Hostname on first start                | Display name shown to recipients                  |
 
@@ -212,7 +234,7 @@ the validated address, and do not follow redirects.
 | zrok / zrok2 | Uses a public headless, force-local share and checks the required CLI flags before starting.                                                                      |
 
 Provider-level open access does **not** bypass private-link authentication.
-Only app-owned processes are stopped. Provider switching is explicit, not
+Only app-owned processes are stopped. Provider switching requires editing `host.json` and restarting, not
 automatic failover. Bandwidth, quotas, provider availability, and account limits
 still apply.
 
