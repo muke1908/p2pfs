@@ -3,11 +3,36 @@
 Share selected files, folders, and plain text from your computer through a
 private browser link.
 
+![A host shares files and a live whitepad through an HTTPS tunnel; the receiver opens a private browser link.](docs/images/sharing-flow.svg)
+
 **Host:** run the publisher locally and create a tunnel.  
 **Receiver:** open the private link in a browser. Nothing to install or run.
 
 There is no registry, peer discovery, receiver application, or central file
 store. The host serves the content; the tunnel provider relays the connection.
+
+## A look inside
+
+**One whitepad, live.** Type on the host; receivers see updates automatically.
+No titles, publish buttons, or back-and-forth.
+
+![Host dashboard with a single whitepad, automatic save status, and file-sharing navigation.](docs/images/whitepad-host.png)
+
+**A browser is all they need.** Download a file, browse a folder, or copy the
+whitepad from a phone or desktop.
+
+<table>
+  <tr>
+    <th>Files and folders</th>
+    <th>Live whitepad</th>
+  </tr>
+  <tr>
+    <td valign="top"><img src="docs/images/files-receiver-mobile.png" width="260" alt="Mobile receiver showing direct file downloads and browsable folder shares."></td>
+    <td valign="top"><img src="docs/images/whitepad-receiver-mobile.png" width="260" alt="Mobile receiver showing the read-only whitepad with Copy text and Select text controls."></td>
+  </tr>
+</table>
+
+_Screenshots use demo content. No real files, passwords, or private links are shown._
 
 ## Start the host
 
