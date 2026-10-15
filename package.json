@@ -13,6 +13,7 @@
   "scripts": {
     "build": "tsc",
     "publisher": "npm run build && node dist/src/cli/main.js",
+    "host-service": "npm run build && node dist/src/cli/service.js",
     "typecheck": "tsc --noEmit",
     "test": "npm run build && tsx --test test/*.test.ts",
     "lint": "eslint src test",

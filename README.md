@@ -189,6 +189,71 @@ The host dashboard and browser receiver use authenticated Server-Sent Events
 for live updates. They reconnect automatically; file-watcher and connection
 errors are shown rather than silently ignored.
 
+## Run persistently on macOS
+
+Use the included **LaunchAgent** to run the publisher without an open terminal.
+It starts when you log in and restarts after a crash, with a 30-second retry
+interval. It runs as your user, not as a system daemon.
+
+First configure your tunnel provider and confirm `npm run publisher` works.
+Then stop that publisher with **Ctrl+C** before installing the service:
+
+```sh
+npm run host-service -- install
+npm run host-service -- start
+```
+
+During installation, macOS prompts for your **existing host password** and saves
+it in Keychain. The installer verifies it against your existing state. It never
+writes the password into the LaunchAgent, environment variables, or command-line
+arguments. At startup, Keychain supplies it to the publisher through stdin.
+If macOS asks for Keychain permission, allow the expected `/usr/bin/security`
+access. The login keychain must be unlocked.
+
+If your publisher uses a custom state directory, pass the same path **when
+installing**:
+
+```sh
+npm run host-service -- install --state-dir ./host-state
+```
+
+Installation prepares the LaunchAgent but does not start it immediately.
+`start` loads it now; otherwise it starts at your next login. Only one service
+is supported per user, using the standard ports `7331` and `7332`.
+Do not run a second publisher against the same state directory or ports.
+
+```sh
+npm run host-service -- status
+npm run host-service -- stop
+npm run host-service -- start
+npm run host-service -- uninstall
+```
+
+`status` shows launchd's process state and last exit status. Check `host.log`
+and `host-error.log` in the state directory's `service-logs` folder for the
+dashboard URL, public endpoint, and startup errors. The installer prints the
+log location. For a custom state directory:
+
+```sh
+tail -f ./host-state/service-logs/host.log ./host-state/service-logs/host-error.log
+```
+
+`stop` unloads it until you start it again or log in again. `uninstall` removes
+the LaunchAgent and its Keychain password, but keeps your shares, settings,
+original files, and logs. Use `stop` then `start` after code or `host.json`
+changes. Logs are retained; remove old logs while the service is stopped if needed.
+
+The installer captures your Node executable, project location, and current
+`PATH` so launchd can find the configured tunnel CLI without loading shell
+profiles. Keep the project and Node installation at those locations. After
+moving the project or replacing Node through a version manager, uninstall and
+reinstall the service. Run all commands **without sudo**.
+
+Your Mac must stay awake and connected to the internet. This service does not
+prevent sleep, run while you are logged out, or bypass provider authentication
+and quotas. Restarting a tunnel may change its public URL; issue new guest links
+when that happens.
+
 ## Host options
 
 ```sh
