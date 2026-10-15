@@ -179,7 +179,7 @@ test('a separate host process serves browser links, persists them across restart
   }
 });
 
-test('publisher CLI starts without registry setup and rejects removed commands', async () => {
+test('publisher CLI always starts the configured tunnel and rejects removed options', async () => {
   for (const command of [
     'share',
     'receive',
@@ -206,6 +206,13 @@ test('publisher CLI starts without registry setup and rejects removed commands',
     ]),
     /unknown option/,
   );
+  await assert.rejects(
+    promisify(execFile)(process.execPath, [
+      'dist/src/cli/main.js',
+      '--no-tunnel',
+    ]),
+    /unknown option/,
+  );
   await writeFile(path.join(root, 'host.json'), '{"provider":"devtunnel"}\n');
   const managementPort = await availablePort();
   let transferPort = await availablePort();
@@ -213,6 +220,8 @@ test('publisher CLI starts without registry setup and rejects removed commands',
   const child = spawn(
     process.execPath,
     [
+      '--import',
+      './dist/test/cli-tunnel-fixture.js',
       'dist/src/cli/main.js',
       '--state-dir',
       root,
@@ -220,7 +229,6 @@ test('publisher CLI starts without registry setup and rejects removed commands',
       String(managementPort),
       '--transfer-port',
       String(transferPort),
-      '--no-tunnel',
       '--password-stdin',
     ],
     { stdio: ['pipe', 'pipe', 'pipe'] },
@@ -238,7 +246,7 @@ test('publisher CLI starts without registry setup and rejects removed commands',
       );
       child.stdout?.on('data', (chunk: Buffer) => {
         output += chunk.toString();
-        if (output.includes('Public tunnel disabled.')) {
+        if (output.includes('Public endpoint:')) {
           clearTimeout(timer);
           resolve();
         }
@@ -264,17 +272,90 @@ test('publisher CLI starts without registry setup and rejects removed commands',
         .provider,
       'devtunnel',
     );
-    assert.equal(state.guestOrigin, undefined);
+    assert.ok(
+      output.includes(`Synthetic tunnel start: devtunnel on ${transferPort}`),
+    );
+    assert.equal(state.guestOrigin, 'https://fixture.example.com');
     assert.equal(
-      (await local('/api/guest-links', 'POST', { label: 'Not public yet' }))
+      (await local('/api/guest-links', 'POST', { label: 'Ready to share' }))
         .status,
-      409,
+      200,
     );
     await stop(child);
     await assert.rejects(readFile(path.join(root, 'process.lock')), {
       code: 'ENOENT',
     });
   } finally {
+    try {
+      await stop(child);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test('publisher exits on tunnel prerequisite failure and releases its listeners and lock', async () => {
+  const root = await realpath(
+    await mkdtemp(path.join(os.tmpdir(), 'p2pfs-cli-failure-')),
+  );
+  const managementPort = await availablePort();
+  let transferPort = await availablePort();
+  while (transferPort === managementPort) transferPort = await availablePort();
+  const child = spawn(
+    process.execPath,
+    [
+      '--import',
+      './dist/test/cli-tunnel-fixture.js',
+      'dist/src/cli/main.js',
+      '--state-dir',
+      root,
+      '--management-port',
+      String(managementPort),
+      '--transfer-port',
+      String(transferPort),
+      '--password-stdin',
+    ],
+    {
+      env: { ...process.env, P2PFS_TEST_TUNNEL_FAILURE: '1' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    },
+  );
+  let output = '';
+  let errors = '';
+  child.stdout.on('data', (chunk: Buffer) => {
+    output += chunk.toString();
+  });
+  child.stderr.on('data', (chunk: Buffer) => {
+    errors += chunk.toString();
+  });
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const exited = new Promise<number | null>((resolve, reject) => {
+      timer = setTimeout(
+        () => reject(new Error('CLI stayed running after tunnel failure')),
+        10_000,
+      );
+      child.once('close', resolve);
+      child.once('error', reject);
+    });
+    child.stdin.end(`${password}\n`);
+    assert.equal(await exited, 1);
+    assert.match(errors, /Synthetic tunnel prerequisite failure/);
+    assert.ok(
+      output.includes(`Synthetic tunnel start: ngrok on ${transferPort}`),
+    );
+    assert.equal(output.includes('Public endpoint:'), false);
+    await assert.rejects(readFile(path.join(root, 'process.lock')), {
+      code: 'ENOENT',
+    });
+    assert.deepEqual(
+      JSON.parse(await readFile(path.join(root, 'host.json'), 'utf8')),
+      { provider: 'ngrok' },
+    );
+    for (const port of [managementPort, transferPort])
+      await assert.rejects(fetch(`http://127.0.0.1:${port}/v1/health`));
+  } finally {
+    clearTimeout(timer);
     try {
       await stop(child);
     } finally {

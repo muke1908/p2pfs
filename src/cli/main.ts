@@ -13,7 +13,6 @@ interface StartOptions {
   transferPort?: number;
   managementPort: number;
   passwordStdin?: boolean;
-  tunnel?: boolean;
   publicUrl?: string;
   allowHost?: string[];
 }
@@ -178,19 +177,10 @@ async function start(options: StartOptions): Promise<void> {
         console.log(
           `Public endpoint: ${options.publicUrl} (externally managed)`,
         );
-      } else if (options.tunnel) {
-        try {
-          await host.startTunnel();
-          console.log(`Public endpoint: ${host.tunnel.url}`);
-        } catch (error) {
-          console.error(
-            `Public sharing unavailable: ${error instanceof Error ? error.message : String(error)}\nLocal dashboard remains available to diagnose/retry.`,
-          );
-        }
-      } else
-        console.log(
-          'Public tunnel disabled. Start it from the dashboard when ready.',
-        );
+      } else {
+        await host.startTunnel();
+        console.log(`Public endpoint: ${host.tunnel.url}`);
+      }
       await stopped;
     } finally {
       process.off('SIGINT', onSignal);
@@ -227,7 +217,6 @@ const cli = new Command()
   );
 cli
   .option('--transfer-port <port>', 'Loopback transfer port', port, 7331)
-  .option('--no-tunnel', 'Start locally without launching a public tunnel')
   .option(
     '--public-url <url>',
     'Use an externally managed, verified HTTPS endpoint',

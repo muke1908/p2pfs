@@ -64,12 +64,13 @@ its app-owned tunnel.
 
 ### Configure the host
 
-The first start creates `host.json` inside the state directory and prints its
-full path. New installations default to ngrok; existing installations keep
-their previously selected provider. To configure before launching a tunnel,
-start once with `npm run publisher -- --no-tunnel`, then stop the host.
+Install and authenticate your tunnel provider **before starting the publisher**.
+The publisher always starts a tunnel (or verifies your externally managed one).
+If no `host.json` exists, it creates one using ngrok for a new installation
+or the previously selected provider for an existing installation.
 
-Edit `host.json` to select your provider:
+To choose a provider before the first run, create `host.json` in your state
+directory:
 
 ```json
 {
@@ -82,18 +83,21 @@ after editing. The file is read at startup; dashboard start/stop buttons use
 that configuration and cannot change it. Invalid configuration stops startup
 with an error rather than silently choosing another provider.
 
-To keep the configuration at a location you choose:
+For example, create `./host-state/host.json` with the contents above, then run:
 
 ```sh
-npm run publisher -- --state-dir ./host-state --no-tunnel
+npm run publisher -- --state-dir ./host-state
 ```
 
-This creates `./host-state/host.json` alongside private runtime state. Do not
-commit that directory. Keep provider credentials in the provider's own CLI
-configuration, not in `host.json`. The former `--provider` flag is removed.
+Without `--state-dir`, the app uses its per-user application-data directory and
+prints the configuration path on startup. Keep provider credentials in the
+provider's own CLI configuration, not in `host.json`. Do not commit the state
+directory, which also holds private runtime data.
 
-If tunnel startup fails, the local dashboard stays available. Check the error,
-fix the provider login/configuration/quota, and retry in **Connection settings**.
+If tunnel startup fails, the publisher exits and cleans up its listeners and
+app-owned tunnel processes. Fix the reported installation, login, configuration,
+or quota issue, then run `npm run publisher` again. There is no local-only
+startup mode or automatic failover to a different provider.
 
 ## Share content and send a link
 
@@ -190,11 +194,7 @@ errors are shown rather than silently ignored.
 ```sh
 npm run publisher -- --help
 npm run publisher -- --name "My host" --state-dir ./host-state
-npm run publisher -- --no-tunnel
 ```
-
-`--no-tunnel` starts locally so you can configure content first and launch a
-managed tunnel from the dashboard later.
 
 The public-content listener and management dashboard both bind to loopback:
 
