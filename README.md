@@ -189,70 +189,50 @@ The host dashboard and browser receiver use authenticated Server-Sent Events
 for live updates. They reconnect automatically; file-watcher and connection
 errors are shown rather than silently ignored.
 
-## Run persistently on macOS
+## Native Mac app
 
-Use the included **LaunchAgent** to run the publisher without an open terminal.
-It starts when you log in and restarts after a crash, with a 30-second retry
-interval. It runs as your user, not as a system daemon.
+Use the lightweight **menu-bar app** instead of leaving a terminal open.
+Opening it starts sharing; **Quit p2pfs** stops its publisher and tunnel.
+There is no login item, automatic restart, or background service.
 
-First configure your tunnel provider and confirm `npm run publisher` works.
-Then stop that publisher with **Ctrl+C** before installing the service:
-
-```sh
-npm run host-service -- install
-npm run host-service -- start
-```
-
-During installation, macOS prompts for your **existing host password** and saves
-it in Keychain. The installer verifies it against your existing state. It never
-writes the password into the LaunchAgent, environment variables, or command-line
-arguments. At startup, Keychain supplies it to the publisher through stdin.
-If macOS asks for Keychain permission, allow the expected `/usr/bin/security`
-access. The login keychain must be unlocked.
-
-If your publisher uses a custom state directory, pass the same path **when
-installing**:
+Build on macOS with Xcode Command Line Tools installed:
 
 ```sh
-npm run host-service -- install --state-dir ./host-state
+npm run app:build
+open dist/p2pfs.app
 ```
 
-Installation prepares the LaunchAgent but does not start it immediately.
-`start` loads it now; otherwise it starts at your next login. Only one service
-is supported per user, using the standard ports `7331` and `7332`.
-Do not run a second publisher against the same state directory or ports.
+Building does **not** open the app or start sharing. Stop any existing terminal
+publisher with **Ctrl+C** before opening the app. Enter your existing host
+password in the native secure prompt. It is passed through a pipe, not command
+arguments or environment variables, and is not saved to disk or Keychain.
+The app asks again each time you start sharing.
+
+The menu shows connection status and provides **Open dashboard**, **Stop
+sharing / Start sharing**, **Open configuration folder**, **Show diagnostics**,
+and **Quit p2pfs**. The dashboard still opens in your browser and requires your
+host password. Closing the browser does not stop sharing; use the menu.
+Startup errors are shown instead of silently retrying. If the app crashes,
+its supervisor stops the publisher and owned tunnel.
+
+For an existing custom state directory, build with the same path:
 
 ```sh
-npm run host-service -- status
-npm run host-service -- stop
-npm run host-service -- start
-npm run host-service -- uninstall
+npm run app:build -- --state-dir ./host-state
 ```
 
-`status` shows launchd's process state and last exit status. Check `host.log`
-and `host-error.log` in the state directory's `service-logs` folder for the
-dashboard URL, public endpoint, and startup errors. The installer prints the
-log location. For a custom state directory:
+You can move `dist/p2pfs.app` into Applications. This is a local launcher, not a
+self-contained distribution: keep this checkout (including `node_modules` and
+`dist`), Node, and your authenticated tunnel CLI installed. The build records
+their local paths and your `PATH` so Finder launches do not depend on shell
+profiles. Rebuild and replace the app after moving the checkout, changing Node,
+or changing your tunnel CLI's location. Run without sudo.
 
-```sh
-tail -f ./host-state/service-logs/host.log ./host-state/service-logs/host-error.log
-```
-
-`stop` unloads it until you start it again or log in again. `uninstall` removes
-the LaunchAgent and its Keychain password, but keeps your shares, settings,
-original files, and logs. Use `stop` then `start` after code or `host.json`
-changes. Logs are retained; remove old logs while the service is stopped if needed.
-
-The installer captures your Node executable, project location, and current
-`PATH` so launchd can find the configured tunnel CLI without loading shell
-profiles. Keep the project and Node installation at those locations. After
-moving the project or replacing Node through a version manager, uninstall and
-reinstall the service. Run all commands **without sudo**.
-
-Your Mac must stay awake and connected to the internet. This service does not
-prevent sleep, run while you are logged out, or bypass provider authentication
-and quotas. Restarting a tunnel may change its public URL; issue new guest links
-when that happens.
+Quit and reopen after changing `host.json`. Your shares, whitepad, and guest
+link settings remain in the state directory. Removing the app does not delete
+them. Your Mac must stay awake and connected; the app does not prevent sleep
+or bypass provider authentication and quotas. A restarted tunnel may get a new
+URL, requiring new guest links.
 
 ## Host options
 

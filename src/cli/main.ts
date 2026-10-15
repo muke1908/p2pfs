@@ -115,13 +115,34 @@ async function acquireLock(directory: string): Promise<() => Promise<void>> {
 }
 
 async function start(options: StartOptions): Promise<void> {
-  if (options.publicUrl) publicUrl(options.publicUrl);
-  const password = await passwordFromInput(Boolean(options.passwordStdin));
-  const directory = path.resolve(options.stateDir);
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  const unlock = await acquireLock(directory);
   let host: Host | undefined;
+  let unlock: (() => Promise<void>) | undefined;
+  let statusTimer: NodeJS.Timeout | undefined;
+  const startup = new AbortController();
+  let signal: (() => void) | undefined;
+  const stopped = new Promise<void>((resolve) => {
+    signal = resolve;
+  });
+  const onSignal = () => {
+    signal?.();
+    startup.abort();
+    void host?.tunnel.stop().catch((error: unknown) => {
+      console.error(
+        `Tunnel shutdown failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
+  };
+  process.once('SIGINT', onSignal);
+  process.once('SIGTERM', onSignal);
+  process.once('disconnect', onSignal);
+  if (process.send && !process.connected) onSignal();
   try {
+    if (options.publicUrl) publicUrl(options.publicUrl);
+    const password = await passwordFromInput(Boolean(options.passwordStdin));
+    startup.signal.throwIfAborted();
+    const directory = path.resolve(options.stateDir);
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    unlock = await acquireLock(directory);
     const initial: Parameters<typeof StateStore.open>[2] = {};
     if (options.name) initial.name = options.name;
     if (options.allowHost || options.publicUrl) {
@@ -133,6 +154,7 @@ async function start(options: StartOptions): Promise<void> {
         throw new Error('Allowed hosts must be lowercase DNS hostnames.');
     }
     const store = await StateStore.open(directory, password, initial);
+    startup.signal.throwIfAborted();
     console.log(
       `Host configuration: ${path.join(directory, 'host.json')} (edit and restart to change provider)`,
     );
@@ -142,55 +164,58 @@ async function start(options: StartOptions): Promise<void> {
       publicUrl: options.publicUrl,
     });
     await host.listen();
+    startup.signal.throwIfAborted();
     console.log(`Local dashboard: ${host.managementUrl}`);
     console.log(
       'Open Guest links in the dashboard to create a private receiving link. Recipients only need a browser.',
     );
     for (const warning of host.state().warnings)
       console.error(`Warning: ${warning}`);
-    let signal: (() => void) | undefined;
-    const startup = new AbortController();
-    const stopped = new Promise<void>((resolve) => {
-      signal = resolve;
-    });
-    const onSignal = () => {
-      signal?.();
-      startup.abort();
-      void host?.tunnel.stop().catch((error: unknown) => {
-        console.error(
-          `Tunnel shutdown failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      });
+    const report = () => {
+      if (!process.connected || !process.send) return;
+      process.send(
+        {
+          status: host!.tunnel.status,
+          dashboard: host!.managementUrl,
+        },
+        (error) => {
+          if (error) onSignal();
+        },
+      );
     };
-    process.once('SIGINT', onSignal);
-    process.once('SIGTERM', onSignal);
-    try {
-      if (options.publicUrl) {
-        const transport = new Transport();
-        const health = await transport.json<{ id: string; protocol: number }>(
-          options.publicUrl,
-          '/v1/health',
-          startup.signal,
-        );
-        if (health.id !== store.state.id || health.protocol !== 1)
-          throw new Error('Public URL points to a different service.');
-        console.log(
-          `Public endpoint: ${options.publicUrl} (externally managed)`,
-        );
-      } else {
-        await host.startTunnel();
-        console.log(`Public endpoint: ${host.tunnel.url}`);
-      }
-      await stopped;
-    } finally {
-      process.off('SIGINT', onSignal);
-      process.off('SIGTERM', onSignal);
+    if (process.send) {
+      statusTimer = setInterval(report, 1000);
+      report();
     }
+    if (options.publicUrl) {
+      const transport = new Transport();
+      const health = await transport.json<{ id: string; protocol: number }>(
+        options.publicUrl,
+        '/v1/health',
+        startup.signal,
+      );
+      if (health.id !== store.state.id || health.protocol !== 1)
+        throw new Error('Public URL points to a different service.');
+      console.log(`Public endpoint: ${options.publicUrl} (externally managed)`);
+    } else {
+      await host.startTunnel();
+      console.log(`Public endpoint: ${host.tunnel.url}`);
+    }
+    report();
+    await stopped;
   } finally {
+    clearInterval(statusTimer);
     try {
       await host?.close();
     } finally {
-      await unlock();
+      try {
+        await unlock?.();
+      } finally {
+        process.off('SIGINT', onSignal);
+        process.off('SIGTERM', onSignal);
+        process.off('disconnect', onSignal);
+        if (process.connected) process.disconnect();
+      }
     }
   }
 }
