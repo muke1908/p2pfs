@@ -1,5 +1,6 @@
 import type { SharedFile } from '../shares/service.js';
 import type { SharedWhitepad } from '../texts/service.js';
+import { addPreview } from '../shares/preview-ui.js';
 
 interface GuestCatalog {
   name: string;
@@ -136,6 +137,11 @@ function renderFiles(): void {
         element('small', size(entry.file.size)),
         element('span', 'Download'),
       );
+      addPreview(
+        item,
+        entry.file,
+        `/guest/shares/${entry.id}/files/${entry.file.id}/preview`,
+      );
       collections.append(item);
       continue;
     }
@@ -177,6 +183,7 @@ function renderFiles(): void {
     row.className = 'file-row';
     const name = element('span', file.name);
     name.className = 'file-name';
+    addPreview(name, file, `/guest/shares/${shareId}/files/${file.id}/preview`);
     const meta = element('span', size(file.size));
     meta.className = 'file-size';
     row.append(name, meta, downloadLink(shareId, file));

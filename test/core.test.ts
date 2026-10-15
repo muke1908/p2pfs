@@ -8,7 +8,10 @@ import {
   rm,
   realpath,
   symlink,
+  readdir,
 } from 'node:fs/promises';
+import sharp from 'sharp';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
 import http from 'node:http';
@@ -25,6 +28,7 @@ import { browseFilesystem } from '../src/shares/browser.js';
 import { Whitepad, MAX_WHITEPAD_LENGTH } from '../src/texts/service.js';
 import type { IncomingMessage } from 'node:http';
 import { GuestLinks, GUEST_LINK_LIFETIME } from '../src/guest/access.js';
+import { MAX_UPLOAD_BYTES } from '../src/shares/uploads.js';
 
 const password = 'test-password-not-a-secret';
 const transport = () => new Transport({ testLoopback: true });
@@ -135,6 +139,333 @@ function guestStream(host: Host, cookie: string, route: string) {
       .once('error', reject);
   });
 }
+
+async function upload(host: Host, name: string, contents: string | Buffer) {
+  const { cookie, csrf } = await localSession(host);
+  return fetch(
+    `${host.managementUrl}/api/uploads?name=${encodeURIComponent(name)}`,
+    {
+      method: 'POST',
+      headers: {
+        cookie,
+        'x-p2pfs-csrf': csrf,
+        'content-type': 'application/octet-stream',
+      },
+      body: typeof contents === 'string' ? contents : new Uint8Array(contents),
+    },
+  );
+}
+
+test('dropped files are private copies, survive restart and are removed without touching originals', async () => {
+  const f = await fixture();
+  let restarted: Host | undefined;
+  try {
+    const original = path.join(f.directory, 'photo.txt');
+    await writeFile(original, 'original');
+    const responses = await Promise.all([
+      upload(f.host, 'photo.txt', 'first copy'),
+      upload(f.host, 'photo.txt', 'second copy'),
+    ]);
+    for (const response of responses)
+      assert.equal(response.status, 200, await response.clone().text());
+    const state = await (await local(f.host, '/api/state')).json();
+    assert.equal(state.configuredShares.length, 2);
+    assert.equal(
+      state.configuredShares.every(
+        (share: { copied: boolean }) => share.copied,
+      ),
+      true,
+    );
+    assert.notEqual(
+      state.configuredShares[0].path,
+      state.configuredShares[1].path,
+    );
+    const id = state.configuredShares[0].id;
+    const copied = state.configuredShares[0].path;
+    const link = await f.host.guestLinks.create('Dropped files');
+    const cookie = await guestCookie(f.host, link.token);
+    const file = f.host.shares.files(id).files[0]!;
+    const route = `/guest/shares/${id}/files/${file.id}/content`;
+    assert.equal(
+      await (
+        await fetch(f.host.transferUrl + route, { headers: { cookie } })
+      ).text(),
+      await readFile(copied, 'utf8'),
+    );
+    await f.host.close();
+    const store = await StateStore.open(
+      path.relative(process.cwd(), f.store.directory),
+      password,
+    );
+    restarted = new Host(store, {
+      transferPort: 0,
+      managementPort: 0,
+      transport: transport(),
+    });
+    await restarted.listen();
+    assert.equal(restarted.shares.list().length, 2);
+    assert.equal(
+      (await local(restarted, `/api/shares/${id}`, 'DELETE')).status,
+      200,
+    );
+    await assert.rejects(readFile(copied), { code: 'ENOENT' });
+    assert.equal(await readFile(original, 'utf8'), 'original');
+    assert.equal(
+      (await readdir(path.join(store.directory, 'uploads'))).length,
+      1,
+    );
+  } finally {
+    await restarted?.close();
+    await f.close();
+  }
+});
+
+test('file drops enforce local auth, CSRF, filename boundaries and size limits', async () => {
+  const f = await fixture();
+  try {
+    const route = '/api/uploads?name=file.txt';
+    const headers = { 'content-type': 'application/octet-stream' };
+    assert.equal(
+      (
+        await fetch(f.host.managementUrl + route, {
+          method: 'POST',
+          headers,
+          body: 'test',
+        })
+      ).status,
+      401,
+    );
+    const session = await localSession(f.host);
+    assert.equal(
+      (
+        await fetch(f.host.managementUrl + route, {
+          method: 'POST',
+          headers: { ...headers, cookie: session.cookie },
+          body: 'test',
+        })
+      ).status,
+      403,
+    );
+    assert.equal(
+      (
+        await fetch(f.host.transferUrl + route, {
+          method: 'POST',
+          headers,
+          body: 'test',
+        })
+      ).status,
+      404,
+    );
+    for (const name of [
+      '../escape',
+      'dir/file',
+      'dir\\file',
+      '.',
+      '..',
+      'bad\u0000name',
+    ]) {
+      const response = await upload(f.host, name, 'test');
+      assert.equal(response.status, 400, `${name}: ${await response.text()}`);
+    }
+    const tooLarge = await new Promise<number>((resolve, reject) => {
+      const request = http.request(
+        f.host.managementUrl + route,
+        {
+          method: 'POST',
+          headers: {
+            ...headers,
+            cookie: session.cookie,
+            'x-p2pfs-csrf': session.csrf,
+            'content-length': MAX_UPLOAD_BYTES + 1,
+          },
+        },
+        (response) => {
+          response.resume();
+          resolve(response.statusCode!);
+        },
+      );
+      request.on('error', reject);
+      request.end();
+    });
+    assert.equal(tooLarge, 413);
+    const empty = await upload(f.host, 'empty.txt', '');
+    assert.equal(empty.status, 200);
+    assert.equal(f.host.shares.list()[0]!.file!.size, 0);
+  } finally {
+    await f.close();
+  }
+});
+
+test('interrupted and failed drops are cleaned up, including leftovers after a crash', async () => {
+  const f = await fixture();
+  let restarted: Host | undefined;
+  try {
+    const session = await localSession(f.host);
+    const root = path.join(f.store.directory, 'uploads');
+    const request = http.request(
+      `${f.host.managementUrl}/api/uploads?name=unfinished.txt`,
+      {
+        method: 'POST',
+        headers: {
+          cookie: session.cookie,
+          'x-p2pfs-csrf': session.csrf,
+          'content-type': 'application/octet-stream',
+        },
+      },
+    );
+    request.on('error', () => {});
+    request.write('partial bytes');
+    let sawPartial = false;
+    for (let i = 0; i < 100 && !sawPartial; i++) {
+      sawPartial = (await readdir(root)).length > 0;
+      if (!sawPartial) await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(sawPartial, true);
+    request.destroy();
+    let clean = false;
+    for (let i = 0; i < 100 && !clean; i++) {
+      clean = (await readdir(root)).length === 0;
+      if (!clean) await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(clean, true);
+    const save = f.store.save.bind(f.store);
+    f.store.save = async () => {
+      throw new Error('Synthetic disk failure');
+    };
+    assert.equal(
+      (await upload(f.host, 'failed.txt', 'not committed')).status,
+      500,
+    );
+    f.store.save = save;
+    assert.equal(f.store.state.shares.length, 0);
+    assert.deepEqual(await readdir(root), []);
+    const orphan = path.join(root, randomUUID());
+    await mkdir(orphan);
+    await writeFile(path.join(orphan, 'leftover'), 'partial');
+    const unrelated = path.join(root, 'keep-me.txt');
+    await writeFile(unrelated, 'not an app upload');
+    await f.host.close();
+    restarted = new Host(await StateStore.open(f.store.directory, password), {
+      transferPort: 0,
+      managementPort: 0,
+      transport: transport(),
+    });
+    await restarted.listen();
+    await assert.rejects(readdir(orphan), { code: 'ENOENT' });
+    assert.equal(await readFile(unrelated, 'utf8'), 'not an app upload');
+  } finally {
+    await restarted?.close();
+    await f.close();
+  }
+});
+
+test('small image previews use existing access boundaries and leave original downloads intact', async () => {
+  const f = await fixture();
+  try {
+    const original = await sharp({
+      create: { width: 640, height: 320, channels: 3, background: '#2d6756' },
+    })
+      .withMetadata()
+      .png()
+      .toBuffer();
+    const created = await upload(f.host, 'picture.png', original);
+    assert.equal(created.status, 200);
+    const { id } = await created.json();
+    const file = f.host.shares.files(id).files[0]!;
+    assert.equal(file.preview, true);
+    const localRoute = `/api/shares/${id}/files/${file.id}/preview`;
+    const guestRoute = `/guest/shares/${id}/files/${file.id}/preview`;
+    assert.equal((await fetch(f.host.managementUrl + localRoute)).status, 401);
+    assert.equal((await fetch(f.host.transferUrl + guestRoute)).status, 401);
+    const link = await f.host.guestLinks.create('Images');
+    const cookie = await guestCookie(f.host, link.token);
+    const previews = await Promise.all([
+      local(f.host, localRoute),
+      ...Array.from({ length: 4 }, () =>
+        fetch(f.host.transferUrl + guestRoute, { headers: { cookie } }),
+      ),
+    ]);
+    for (const response of previews) {
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get('content-type'), 'image/webp');
+      assert.equal(response.headers.get('cache-control'), 'no-store');
+      const bytes = Buffer.from(await response.arrayBuffer());
+      assert.ok(bytes.length < original.length);
+      const metadata = await sharp(bytes).metadata();
+      assert.equal(metadata.width, 128);
+      assert.equal(metadata.height, 64);
+      assert.equal(metadata.exif, undefined);
+    }
+    const download = await fetch(
+      f.host.transferUrl + guestRoute.replace('/preview', '/content'),
+      { headers: { cookie } },
+    );
+    assert.match(download.headers.get('content-disposition')!, /attachment;/);
+    assert.deepEqual(Buffer.from(await download.arrayBuffer()), original);
+    const stored = f.store.state.guestLinks!.find(
+      (entry) => entry.id === link.id,
+    )!;
+    stored.scope = 'selected';
+    stored.shareIds = [];
+    assert.equal(
+      (await fetch(f.host.transferUrl + guestRoute, { headers: { cookie } }))
+        .status,
+      404,
+    );
+    stored.scope = 'session';
+    await f.host.guestLinks.revoke(link.id);
+    assert.equal(
+      (await fetch(f.host.transferUrl + guestRoute, { headers: { cookie } }))
+        .status,
+      401,
+    );
+    await f.host.shares.remove(id);
+    assert.equal((await local(f.host, localRoute)).status, 404);
+  } finally {
+    await f.close();
+  }
+});
+
+test('folder images get previews while unsupported, corrupt and disguised images remain downloadable', async () => {
+  const f = await fixture();
+  try {
+    const folder = path.join(f.directory, 'images');
+    await mkdir(folder);
+    await writeFile(
+      path.join(folder, 'small.jpg'),
+      await sharp({
+        create: { width: 20, height: 10, channels: 3, background: '#ffffff' },
+      })
+        .jpeg()
+        .toBuffer(),
+    );
+    await writeFile(path.join(folder, 'broken.png'), 'not an image');
+    await writeFile(
+      path.join(folder, 'disguised.png'),
+      '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"></svg>',
+    );
+    await writeFile(path.join(folder, 'text.txt'), 'plain text');
+    const id = await f.host.shares.add(folder);
+    const files = f.host.shares.files(id).files;
+    for (const file of files) {
+      const response = await local(
+        f.host,
+        `/api/shares/${id}/files/${file.id}/preview`,
+      );
+      assert.equal(response.status, file.name === 'small.jpg' ? 200 : 415);
+      if (file.name === 'text.txt') assert.equal(file.preview, undefined);
+      if (file.name === 'small.jpg') {
+        assert.equal(
+          (await sharp(Buffer.from(await response.arrayBuffer())).metadata())
+            .width,
+          20,
+        );
+      }
+    }
+  } finally {
+    await f.close();
+  }
+});
 
 test('catalogs distinguish standalone files from one-file folders and support direct downloads', async () => {
   const a = await fixture();

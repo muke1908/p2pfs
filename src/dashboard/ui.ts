@@ -1,5 +1,7 @@
 import type { SharedWhitepad } from '../texts/service.js';
 import type { GuestLinkSummary } from '../guest/access.js';
+import type { SharedFile } from '../shares/service.js';
+import { addPreview } from '../shares/preview-ui.js';
 
 interface DashboardState {
   name: string;
@@ -11,8 +13,9 @@ interface DashboardState {
     count: number;
     path: string;
     warnings: string[];
+    file?: SharedFile;
   }[];
-  configuredShares: { id: string; path: string }[];
+  configuredShares: { id: string; path: string; copied: boolean }[];
   whitepad: SharedWhitepad;
   guestLinks: GuestLinkSummary[];
   guestOrigin?: string;
@@ -53,6 +56,7 @@ let padPaused = false;
 let padTimer: ReturnType<typeof setTimeout> | undefined;
 let padGeneration = 0;
 let generatedGuestId = '';
+let copying: AbortController | undefined;
 
 function node<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -108,6 +112,7 @@ async function api<T>(
 }
 
 function lock(): void {
+  copying?.abort();
   unlocked = false;
   updates?.close();
   updates = undefined;
@@ -307,12 +312,21 @@ function renderCatalog(): void {
       const indexed = state.shares.find((entry) => entry.id === share.id);
       const { row, actions } = fileRow(
         indexed?.name ?? basename(share.path),
-        [share.path, ...(indexed?.warnings ?? [])].join(' · '),
+        [
+          share.copied ? 'Local copy · Original unchanged' : share.path,
+          ...(indexed?.warnings ?? []),
+        ].join(' · '),
         indexed
           ? `${indexed.count} ${indexed.count === 1 ? 'file' : 'files'}`
           : 'Unavailable',
         indexed?.kind !== 'file',
       );
+      if (indexed?.file)
+        addPreview(
+          row.querySelector('.file-badge')!,
+          indexed.file,
+          `/api/shares/${share.id}/files/${indexed.file.id}/preview`,
+        );
       if (indexed)
         actions.append(
           button(
@@ -335,6 +349,12 @@ function renderCatalog(): void {
           async () => {
             revokeId = share.id;
             text('revoke-path', share.path);
+            text(
+              'revoke-copy-note',
+              share.copied
+                ? 'The local copy will be deleted. Your original file is unchanged.'
+                : '',
+            );
             text('revoke-error', '');
             dialog('revoke-dialog').showModal();
           },
@@ -770,7 +790,7 @@ element('whitepad').addEventListener('input', () => {
 onClick('pad-retry', () => recoverPad(false), 'text-error');
 onClick('pad-reload', () => recoverPad(true), 'text-error');
 window.addEventListener('beforeunload', (event) => {
-  if (padDirty || padSaving) {
+  if (padDirty || padSaving || copying) {
     event.preventDefault();
     event.returnValue = '';
   }
@@ -800,6 +820,105 @@ onClick(
   'text-error',
 );
 onClick('dismiss-error', async () => text('error-text', ''));
+const dropZone = element('drop-zone');
+async function copyFiles(files: File[]): Promise<void> {
+  if (!unlocked) throw new Error('Unlock the workspace before dropping files.');
+  if (copying) throw new Error('Wait for the current files to finish copying.');
+  if (!files.length)
+    throw new Error('Drop files here. Use Share something for folders.');
+  if (files.some((file) => file.size > 1024 * 1024 * 1024))
+    throw new Error(
+      'Dropped files must be 1 GiB or smaller. Use Share something to share larger originals.',
+    );
+  const controller = new AbortController();
+  copying = controller;
+  element<HTMLButtonElement>('choose-copies').disabled = true;
+  element('cancel-copy').hidden = false;
+  let count = 0;
+  try {
+    for (const file of files) {
+      text(
+        'copy-status',
+        `Copying ${count + 1} of ${files.length}: ${file.name}`,
+      );
+      const response = await fetch(
+        `/api/uploads?name=${encodeURIComponent(file.name)}`,
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/octet-stream',
+            'x-p2pfs-csrf': csrf,
+          },
+          body: file,
+          signal: controller.signal,
+        },
+      );
+      const result = await response.json();
+      if (!response.ok) {
+        if (response.status === 401) lock();
+        throw new Error(
+          result.error ?? `Copy failed (HTTP ${response.status}).`,
+        );
+      }
+      count++;
+      await refresh();
+    }
+    text(
+      'notice',
+      `${count} ${count === 1 ? 'file' : 'files'} shared as local copies.`,
+    );
+  } catch (error) {
+    throw new Error(
+      `${count} ${count === 1 ? 'file' : 'files'} shared. ${controller.signal.aborted ? 'Remaining copies cancelled.' : message(error)}`,
+    );
+  } finally {
+    copying = undefined;
+    text('copy-status', '');
+    element<HTMLButtonElement>('choose-copies').disabled = false;
+    element('cancel-copy').hidden = true;
+  }
+}
+for (const eventName of ['dragover', 'drop'])
+  document.addEventListener(eventName, (event) => {
+    if ((event as DragEvent).dataTransfer?.types.includes('Files'))
+      event.preventDefault();
+  });
+dropZone.addEventListener('dragover', (event) => {
+  if (event.dataTransfer?.types.includes('Files')) {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = copying ? 'none' : 'copy';
+    dropZone.classList.add('dragging');
+  }
+});
+dropZone.addEventListener('dragleave', () =>
+  dropZone.classList.remove('dragging'),
+);
+dropZone.addEventListener('drop', (event) => {
+  event.preventDefault();
+  dropZone.classList.remove('dragging');
+  const items = Array.from(event.dataTransfer?.items ?? []);
+  const directories = items.some(
+    (item) => item.webkitGetAsEntry?.()?.isDirectory,
+  );
+  const files = Array.from(event.dataTransfer?.files ?? []);
+  void action(async () => {
+    if (directories)
+      throw new Error(
+        'Use Share something to share folders. Drop individual files here.',
+      );
+    await copyFiles(files);
+  });
+});
+onClick('choose-copies', async () =>
+  element<HTMLInputElement>('copy-input').click(),
+);
+element('copy-input').addEventListener('change', () => {
+  const input = element<HTMLInputElement>('copy-input');
+  const files = Array.from(input.files ?? []);
+  input.value = '';
+  if (files.length) void action(() => copyFiles(files));
+});
+onClick('cancel-copy', async () => copying?.abort());
 element('search').addEventListener('input', renderCatalog);
 for (const id of ['logout', 'top-lock'])
   onClick(id, async () => {

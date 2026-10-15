@@ -101,8 +101,10 @@ startup mode or automatic failover to a different provider.
 
 ## Share content and send a link
 
-1. In **My shares**, choose **Share something**. Select a file, share the current
-   folder, or enter an absolute file/folder path in the chooser. Use **Text** to
+1. In **My shares**, drop files onto **Drop files to share**, or use **Choose
+   files**, to share local copies. To share an original file or folder instead,
+   choose **Share something** and use the local chooser or enter an absolute
+   path. Use **Text** to
    write in the single **Whitepad**. It saves and streams automatically as you
    type, with no title or publish button.
 2. Open **Guest links**, name the session, and choose **Create session link**.
@@ -117,6 +119,38 @@ is never included.
 
 Do not send the bare tunnel endpoint or the local dashboard URL. Only the
 private receiving link grants browser access.
+
+### Dropping files
+
+Drop one or several files into the host dashboard. Browsers cannot expose their
+original filesystem paths, so the host streams a **local copy** into its private
+state directory before publishing it. Copies are labeled in the list, survive
+host restarts, and do not track later edits to the originals. Files with the
+same name remain separate shares.
+
+Each dropped file can be up to **1 GiB**. Use **Share something** for larger
+originals or folders; folders are not uploaded by drag-and-drop. Copying shows
+the current filename and offers **Cancel**. Files already added remain shared
+if a later file fails or is cancelled. Failed or interrupted copies are removed,
+including leftovers recovered after a host crash.
+
+**Stop sharing** deletes the app's local copy, not the original. Files chosen
+through the original-path picker are never deleted. Stored copies use local
+disk space; there is no cloud upload or central file store.
+
+### Image previews
+
+Supported images have compact thumbnails in the host's share list and in the
+recipient's file lists, including images inside shared folders. Downloads still
+contain the **unmodified original file**.
+
+Previews are generated locally as WebP thumbnails up to **128 × 128 pixels**,
+without image metadata. They use the same authenticated access and link scope
+as downloads and are not stored in a persistent thumbnail cache. JPEG, PNG,
+WebP, GIF (first frame), AVIF, and TIFF are attempted for files up to **20 MiB**
+and **40 megapixels**. Unsupported, corrupt, or oversized images keep their
+normal file listing and download action; a preview is never required to share
+a file.
 
 ## Receive in a browser
 

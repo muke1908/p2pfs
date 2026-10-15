@@ -7,6 +7,8 @@ import { AppError, Sessions, digest } from '../security/auth.js';
 import { Transport, tunnelHosts, publicUrl } from '../security/transport.js';
 import { Shares } from '../shares/service.js';
 import { browseFilesystem } from '../shares/browser.js';
+import { Uploads, MAX_UPLOAD_BYTES } from '../shares/uploads.js';
+import { Previews } from '../shares/previews.js';
 import { Whitepad, MAX_WHITEPAD_LENGTH } from '../texts/service.js';
 import { Tunnel } from '../tunnels/manager.js';
 import { page } from '../dashboard/page.js';
@@ -57,6 +59,8 @@ export class Host {
   readonly transfer: FastifyInstance;
   readonly management: FastifyInstance;
   readonly shares: Shares;
+  private uploads: Uploads;
+  private previews: Previews;
   readonly whitepad: Whitepad;
   readonly guestLinks: GuestLinks;
   readonly tunnel: Tunnel;
@@ -129,6 +133,8 @@ export class Host {
       });
     }
     this.shares = new Shares(store);
+    this.uploads = new Uploads(store, this.shares);
+    this.previews = new Previews(this.shares);
     this.whitepad = new Whitepad(store);
     this.guestLinks = new GuestLinks(store);
     this.tunnel = new Tunnel(this.transport, store.state.id);
@@ -138,6 +144,7 @@ export class Host {
 
   async listen(): Promise<void> {
     try {
+      await this.uploads.initialize();
       await this.shares.initialize();
       this.transferUrl = await this.transfer.listen({
         host: '127.0.0.1',
@@ -182,6 +189,7 @@ export class Host {
       }
     };
     await finish(() => this.tunnel.stop());
+    await finish(() => this.uploads.close());
     this.shares.close();
     await finish(() => this.transfer.close());
     await finish(() => this.management.close());
@@ -196,7 +204,10 @@ export class Host {
       name: this.store.state.name,
       managementUrl: this.managementUrl,
       shares: this.shares.list(true),
-      configuredShares: this.store.state.shares,
+      configuredShares: this.store.state.shares.map((share) => ({
+        ...share,
+        copied: this.uploads.owns(share.path),
+      })),
       whitepad: this.whitepad.get(),
       guestLinks: this.guestLinks.list(),
       guestOrigin: this.guestOrigin(),
@@ -237,9 +248,14 @@ export class Host {
         "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",
       );
       if (
-        ['/', '/ui.js', '/favicon.ico', '/api/login', '/api/csrf'].includes(
-          request.url.split('?')[0]!,
-        )
+        [
+          '/',
+          '/ui.js',
+          '/shares/preview-ui.js',
+          '/favicon.ico',
+          '/api/login',
+          '/api/csrf',
+        ].includes(request.url.split('?')[0]!)
       )
         return;
       const cookie = this.cookie(request);
@@ -264,6 +280,16 @@ export class Host {
         .type('text/javascript')
         .send(
           await readFile(new URL('dashboard/ui.js', browserAssets), 'utf8'),
+        ),
+    );
+    this.management.get('/shares/preview-ui.js', async (_request, reply) =>
+      reply
+        .type('text/javascript')
+        .send(
+          await readFile(
+            new URL('shares/preview-ui.js', browserAssets),
+            'utf8',
+          ),
         ),
     );
     this.management.post<{ Body: { password: string } }>(
@@ -386,6 +412,52 @@ export class Host {
       },
       async (request) => ({ id: await this.shares.add(request.body.path) }),
     );
+    this.management.addContentTypeParser(
+      'application/octet-stream',
+      (_request, payload, done) => done(null, payload),
+    );
+    this.management.post<{ Body: Readable; Querystring: { name: string } }>(
+      '/api/uploads',
+      {
+        bodyLimit: MAX_UPLOAD_BYTES,
+        schema: {
+          querystring: bodySchema({ name: { ...text, maxLength: 240 } }, [
+            'name',
+          ]),
+        },
+      },
+      async (request) => {
+        if (request.headers['content-type'] !== 'application/octet-stream')
+          throw new AppError(415, 'Send a file as application/octet-stream.');
+        if (Number(request.headers['content-length']) > MAX_UPLOAD_BYTES)
+          throw new AppError(413, 'Dropped files must be 1 GiB or smaller.');
+        const cookie = this.cookie(request);
+        return {
+          id: await this.uploads.add(request.body, request.query.name, () =>
+            this.localSessions.require(cookie),
+          ),
+        };
+      },
+    );
+    this.management.get<{ Params: { shareId: string; fileId: string } }>(
+      '/api/shares/:shareId/files/:fileId/preview',
+      {
+        schema: {
+          params: bodySchema({ shareId: identifier, fileId: identifier }, [
+            'shareId',
+            'fileId',
+          ]),
+        },
+      },
+      async (request, reply) => {
+        const preview = await this.previews.create(
+          request.params.shareId,
+          request.params.fileId,
+        );
+        this.localSessions.require(this.cookie(request));
+        return reply.type('image/webp').send(preview);
+      },
+    );
     this.management.post<{ Params: { id: string } }>(
       '/api/shares/:id/refresh',
       {
@@ -403,6 +475,7 @@ export class Host {
       },
       async (request) => {
         await this.shares.remove(request.params.id);
+        await this.uploads.cleanup();
         return { ok: true };
       },
     );
@@ -482,6 +555,16 @@ export class Host {
       reply
         .type('text/javascript')
         .send(await readFile(new URL('guest/ui.js', browserAssets), 'utf8')),
+    );
+    this.transfer.get('/shares/preview-ui.js', async (_request, reply) =>
+      reply
+        .type('text/javascript')
+        .send(
+          await readFile(
+            new URL('shares/preview-ui.js', browserAssets),
+            'utf8',
+          ),
+        ),
     );
     this.transfer.post<{ Body: { token: string } }>(
       '/guest/session',
@@ -568,6 +651,31 @@ export class Host {
         )
           throw new AppError(404, 'Share not available through this link.');
         return this.shares.files(request.params.shareId, request.query.offset);
+      },
+    );
+    this.transfer.get<{ Params: { shareId: string; fileId: string } }>(
+      '/guest/shares/:shareId/files/:fileId/preview',
+      {
+        schema: {
+          params: bodySchema({ shareId: identifier, fileId: identifier }, [
+            'shareId',
+            'fileId',
+          ]),
+        },
+      },
+      async (request, reply) => {
+        const link = authorized(request);
+        if (
+          link.scope !== 'session' &&
+          !link.shareIds.includes(request.params.shareId)
+        )
+          throw new AppError(404, 'Share not available through this link.');
+        const preview = await this.previews.create(
+          request.params.shareId,
+          request.params.fileId,
+        );
+        authorized(request);
+        return reply.type('image/webp').send(preview);
       },
     );
     this.transfer.get<{ Params: { shareId: string; fileId: string } }>(

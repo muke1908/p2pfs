@@ -5,12 +5,14 @@ import { Readable } from 'node:stream';
 import { watch, type FSWatcher } from 'node:fs';
 import type { StateStore, ShareDefinition } from '../config/state.js';
 import { AppError } from '../security/auth.js';
+import { hasPreview } from './previews.js';
 
 export interface SharedFile {
   id: string;
   name: string;
   size: number;
   modified: number;
+  preview?: boolean;
 }
 interface IndexedFile extends SharedFile {
   absolute: string;
@@ -54,6 +56,7 @@ export class Shares {
   private refreshing = new Set<string>();
   private dirty = new Set<string>();
   private closed = false;
+  private mutation: Promise<unknown> = Promise.resolve();
   constructor(private store: StateStore) {}
 
   async initialize(): Promise<void> {
@@ -89,13 +92,32 @@ export class Shares {
     return [...this.unavailable.values(), ...this.watchWarnings.values()];
   }
 
-  async add(input: string): Promise<string> {
+  private change<T>(work: () => Promise<T>): Promise<T> {
+    const operation = this.mutation.then(work);
+    this.mutation = operation.catch(() => {});
+    return operation;
+  }
+
+  add(input: string): Promise<string> {
+    return this.change(() => this.addPath(input));
+  }
+
+  private async addPath(input: string): Promise<string> {
+    if (this.closed) throw new AppError(503, 'Host is stopping.');
     if (this.store.state.shares.length >= 100)
       throw new AppError(400, 'Share limit reached.');
     const definition = { id: randomUUID(), path: path.resolve(input) };
     const indexed = await this.index(definition);
+    if (this.closed) throw new AppError(503, 'Host is stopping.');
     this.store.state.shares.push(definition);
-    await this.store.save();
+    try {
+      await this.store.save();
+    } catch (error) {
+      this.store.state.shares = this.store.state.shares.filter(
+        (share) => share.id !== definition.id,
+      );
+      throw error;
+    }
     this.entries.set(definition.id, indexed);
     await this.observe(definition);
     this.revision++;
@@ -112,20 +134,33 @@ export class Shares {
     this.revision++;
   }
 
-  async remove(id: string): Promise<void> {
+  remove(id: string): Promise<void> {
+    return this.change(() => this.removeShare(id));
+  }
+
+  private async removeShare(id: string): Promise<void> {
     const entry = this.entries.get(id);
     if (!entry && !this.store.state.shares.some((share) => share.id === id))
       throw new AppError(404, 'Share not found.');
+    const previous = this.store.state.shares;
+    this.store.state.shares = previous.filter((share) => share.id !== id);
+    try {
+      await this.store.save();
+    } catch (error) {
+      this.store.state.shares = previous;
+      throw error;
+    }
     if (entry) this.cancel(entry);
     this.entries.delete(id);
     this.stopWatching(id);
     this.unavailable.delete(id);
     this.watchWarnings.delete(id);
-    this.store.state.shares = this.store.state.shares.filter(
-      (share) => share.id !== id,
-    );
-    await this.store.save();
     this.revision++;
+  }
+
+  requireFile(shareId: string, fileId: string): void {
+    if (!this.get(shareId).files.has(fileId))
+      throw new AppError(404, 'File not found; refresh the catalog.');
   }
 
   files(id: string, offset = 0): { files: SharedFile[]; next: number | null } {
@@ -133,7 +168,13 @@ export class Shares {
     return {
       files: files
         .slice(offset, offset + 100)
-        .map(({ id, name, size, modified }) => ({ id, name, size, modified })),
+        .map(({ id, name, size, modified }) => ({
+          id,
+          name,
+          size,
+          modified,
+          ...(hasPreview(name, size) ? { preview: true } : {}),
+        })),
       next: offset + 100 < files.length ? offset + 100 : null,
     };
   }
