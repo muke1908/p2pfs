@@ -16,6 +16,7 @@ import path from 'node:path';
 import os from 'node:os';
 import http from 'node:http';
 import { StateStore } from '../src/config/state.js';
+import { lanAddress } from '../src/config/network.js';
 import { Sessions, passwordHash, secret } from '../src/security/auth.js';
 import {
   Transport,
@@ -27,7 +28,12 @@ import { parseEndpoint, Tunnel } from '../src/tunnels/manager.js';
 import { browseFilesystem } from '../src/shares/browser.js';
 import { Whitepad, MAX_WHITEPAD_LENGTH } from '../src/texts/service.js';
 import type { IncomingMessage } from 'node:http';
-import { GuestLinks, GUEST_LINK_LIFETIME } from '../src/guest/access.js';
+import {
+  GuestLinks,
+  GUEST_LINK_LIFETIME,
+  GUEST_PIN_LIFETIME,
+  GUEST_PIN_COOLDOWN,
+} from '../src/guest/access.js';
 import { MAX_UPLOAD_BYTES } from '../src/shares/uploads.js';
 
 const password = 'test-password-not-a-secret';
@@ -39,6 +45,7 @@ async function fixture(publicUrl?: string) {
   );
   const store = await StateStore.open(path.join(directory, 'state'), password);
   const host = new Host(store, {
+    access: 'tunnel',
     transferPort: 0,
     managementPort: 0,
     transport: transport(),
@@ -198,6 +205,7 @@ test('dropped files are private copies, survive restart and are removed without 
       password,
     );
     restarted = new Host(store, {
+      access: 'tunnel',
       transferPort: 0,
       managementPort: 0,
       transport: transport(),
@@ -346,6 +354,7 @@ test('interrupted and failed drops are cleaned up, including leftovers after a c
     await writeFile(unrelated, 'not an app upload');
     await f.host.close();
     restarted = new Host(await StateStore.open(f.store.directory, password), {
+      access: 'tunnel',
       transferPort: 0,
       managementPort: 0,
       transport: transport(),
@@ -396,6 +405,28 @@ test('small image previews use existing access boundaries and leave original dow
       assert.equal(metadata.height, 64);
       assert.equal(metadata.exif, undefined);
     }
+    const localImage = localRoute.replace('/preview', '/image');
+    const guestImage = guestRoute.replace('/preview', '/image');
+    assert.equal((await fetch(f.host.managementUrl + localImage)).status, 401);
+    assert.equal((await fetch(f.host.transferUrl + guestImage)).status, 401);
+    for (const response of await Promise.all([
+      local(f.host, localImage),
+      fetch(f.host.transferUrl + guestImage, { headers: { cookie } }),
+    ])) {
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get('content-type'), 'image/png');
+      assert.equal(response.headers.get('cache-control'), 'no-store');
+      assert.doesNotMatch(
+        response.headers.get('content-disposition') ?? '',
+        /attachment/,
+      );
+      const metadata = await sharp(
+        Buffer.from(await response.arrayBuffer()),
+      ).metadata();
+      assert.equal(metadata.width, 640);
+      assert.equal(metadata.height, 320);
+      assert.equal(metadata.exif, undefined);
+    }
     const download = await fetch(
       f.host.transferUrl + guestRoute.replace('/preview', '/content'),
       { headers: { cookie } },
@@ -408,6 +439,11 @@ test('small image previews use existing access boundaries and leave original dow
     stored.scope = 'selected';
     stored.shareIds = [];
     assert.equal(
+      (await fetch(f.host.transferUrl + guestImage, { headers: { cookie } }))
+        .status,
+      404,
+    );
+    assert.equal(
       (await fetch(f.host.transferUrl + guestRoute, { headers: { cookie } }))
         .status,
       404,
@@ -415,11 +451,17 @@ test('small image previews use existing access boundaries and leave original dow
     stored.scope = 'session';
     await f.host.guestLinks.revoke(link.id);
     assert.equal(
+      (await fetch(f.host.transferUrl + guestImage, { headers: { cookie } }))
+        .status,
+      401,
+    );
+    assert.equal(
       (await fetch(f.host.transferUrl + guestRoute, { headers: { cookie } }))
         .status,
       401,
     );
     await f.host.shares.remove(id);
+    assert.equal((await local(f.host, localImage)).status, 404);
     assert.equal((await local(f.host, localRoute)).status, 404);
   } finally {
     await f.close();
@@ -448,6 +490,11 @@ test('folder images get previews while unsupported, corrupt and disguised images
     const id = await f.host.shares.add(folder);
     const files = f.host.shares.files(id).files;
     for (const file of files) {
+      const fullSize = await local(
+        f.host,
+        `/api/shares/${id}/files/${file.id}/image`,
+      );
+      assert.equal(fullSize.status, file.name === 'small.jpg' ? 200 : 415);
       const response = await local(
         f.host,
         `/api/shares/${id}/files/${file.id}/preview`,
@@ -710,7 +757,22 @@ test('guest links use the configured HTTPS origin and Secure cookies behind an e
       label: 'HTTPS delivery',
     });
     assert.equal(response.status, 200);
-    const { url } = await response.json();
+    const invitation = await response.json();
+    const { url } = invitation;
+    assert.equal(invitation.pin, undefined);
+    assert.equal(invitation.joinUrl, undefined);
+    assert.equal(
+      (
+        await fetch(`${f.host.transferUrl}/guest/pin`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ pin: '1234' }),
+        })
+      ).status,
+      404,
+    );
+    const page = await (await fetch(`${f.host.transferUrl}/receive`)).text();
+    assert.match(page, /id="pin-form" hidden/);
     assert.equal(new URL(url).origin, 'https://guest.example.org');
     const token = new URLSearchParams(new URL(url).hash.slice(1)).get('token');
     const session = await fetch(`${f.host.transferUrl}/guest/session`, {
@@ -725,6 +787,177 @@ test('guest links use the configured HTTPS origin and Secure cookies behind an e
     assert.match(session.headers.get('set-cookie')!, /; Secure$/);
     assert.equal((await session.json()).ok, true);
   } finally {
+    await f.close();
+  }
+});
+
+test('LAN guest proxy URLs preserve PIN access, path-scoped sessions and native links without exposing management', async (t) => {
+  const address = '192.168.50.25';
+  t.mock.method(os, 'networkInterfaces', () => ({
+    ethernet: [
+      {
+        address,
+        netmask: '255.255.255.0',
+        family: 'IPv4',
+        mac: '00:11:22:33:44:55',
+        internal: false,
+        cidr: `${address}/24`,
+      },
+    ],
+  }));
+  const f = await fixture();
+  let host: Host | undefined;
+  try {
+    await f.host.close();
+    const prefix = '/apps/p2pfs';
+    const origin = 'http://mukecz.home.arpa';
+    await writeFile(
+      path.join(f.store.directory, 'host.json'),
+      JSON.stringify({ guestUrl: `${origin}${prefix}/` }),
+    );
+    const store = await StateStore.open(f.store.directory, password);
+    assert.equal(store.guestUrl, `${origin}${prefix}`);
+    host = new Host(store);
+    host.transferUrl = `http://${address}:7331`;
+    host.managementUrl = 'http://127.0.0.1:7332';
+    const guest = (route: string, cookie?: string) =>
+      host!.transfer.inject({
+        url: `${prefix}${route}`,
+        headers: {
+          host: 'mukecz.home.arpa',
+          origin,
+          ...(cookie ? { cookie } : {}),
+        },
+      });
+    const filename = path.join(f.directory, 'proxy-photo.png');
+    const image = await sharp({
+      create: { width: 2, height: 2, channels: 3, background: 'blue' },
+    })
+      .png()
+      .toBuffer();
+    await writeFile(filename, image);
+    const share = await host.shares.add(filename);
+    await host.whitepad.update('Guest proxy text', 0);
+    const login = await host.management.inject({
+      method: 'POST',
+      url: '/api/login',
+      headers: { host: '127.0.0.1:7332' },
+      payload: { password },
+    });
+    assert.equal(login.statusCode, 200);
+    const invitation = await host.management.inject({
+      method: 'POST',
+      url: '/api/guest-links',
+      headers: {
+        host: '127.0.0.1:7332',
+        cookie: String(login.headers['set-cookie']).split(';')[0],
+        'x-p2pfs-csrf': login.json().csrf,
+      },
+      payload: { label: 'Proxy session' },
+    });
+    assert.equal(invitation.statusCode, 200, invitation.body);
+    const link = invitation.json();
+    assert.equal(link.joinUrl, `${origin}${prefix}/receive`);
+    assert.ok(link.url.startsWith(`${link.joinUrl}#token=`));
+    for (const route of [
+      '/',
+      '/receive',
+      '/guest/ui.js',
+      '/shares/preview-ui.js',
+    ])
+      assert.equal((await guest(route)).statusCode, 200, route);
+    assert.match((await guest('/')).body, /src="\.\/guest\/ui.js"/);
+    assert.equal(
+      (await guest('/receive.js')).headers.location,
+      `${prefix}/guest/ui.js`,
+    );
+    assert.equal((await guest('/guest/catalog')).statusCode, 401);
+    const joined = await host.transfer.inject({
+      method: 'POST',
+      url: `${prefix}/guest/pin`,
+      headers: { host: 'mukecz.home.arpa', origin },
+      payload: { pin: link.pin },
+    });
+    assert.equal(joined.statusCode, 200, joined.body);
+    const setCookie = String(joined.headers['set-cookie']);
+    assert.match(
+      setCookie,
+      /HttpOnly; SameSite=Strict; Path=\/apps\/p2pfs\/guest;/,
+    );
+    assert.equal(setCookie.includes('Secure'), false);
+    const cookie = setCookie.split(';')[0]!;
+    assert.equal(
+      (await guest('/guest/catalog', cookie)).json().whitepad.content,
+      'Guest proxy text',
+    );
+    const file = host.shares.files(share).files[0]!;
+    const content = await guest(
+      `/guest/shares/${share}/files/${file.id}/content`,
+      cookie,
+    );
+    assert.equal(content.statusCode, 200);
+    assert.deepEqual(content.rawPayload, image);
+    assert.equal(
+      (await guest(`/guest/shares/${share}/files/${file.id}/preview`, cookie))
+        .headers['content-type'],
+      'image/webp',
+    );
+    for (const route of ['/api/state', '/api/login', '/guest/whitepad/unknown'])
+      assert.equal((await guest(route, cookie)).statusCode, 404, route);
+    for (const headers of [
+      { host: 'evil.test', origin },
+      { host: 'mukecz.home.arpa', origin: 'http://evil.test' },
+      { host: 'mukecz.home.arpa', origin, 'sec-fetch-site': 'cross-site' },
+    ])
+      assert.equal(
+        (
+          await host.transfer.inject({
+            method: 'POST',
+            url: `${prefix}/guest/session`,
+            headers,
+            payload: {
+              token: new URLSearchParams(new URL(link.url).hash.slice(1)).get(
+                'token',
+              ),
+            },
+          })
+        ).statusCode,
+        403,
+      );
+    assert.equal(
+      (
+        await host.transfer.inject({
+          url: '/receive',
+          headers: { host: 'mukecz.home.arpa' },
+        })
+      ).statusCode,
+      403,
+    );
+    const nativeSession = await host.transfer.inject({
+      method: 'POST',
+      url: '/guest/session',
+      headers: { host: `${address}:7331`, origin: host.transferUrl },
+      payload: {
+        token: new URLSearchParams(new URL(link.url).hash.slice(1)).get(
+          'token',
+        ),
+      },
+    });
+    assert.equal(nativeSession.statusCode, 200);
+    assert.match(String(nativeSession.headers['set-cookie']), /Path=\/guest;/);
+    assert.equal(
+      (
+        await host.management.inject({
+          url: '/api/state',
+          headers: { host: 'mukecz.home.arpa', origin, cookie },
+        })
+      ).statusCode,
+      403,
+    );
+    await host.guestLinks.revoke(link.id);
+    assert.equal((await guest('/guest/catalog', cookie)).statusCode, 401);
+  } finally {
+    await host?.close();
     await f.close();
   }
 });
@@ -801,6 +1034,209 @@ test('guest link creation serializes concurrent capacity checks and throttles in
     assert.throws(
       () => f.host.guestLinks.exchange(secret()),
       /capacity reached/,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test('LAN PINs are single-use, expire and rotate without shortening joined guest access', async (t) => {
+  const f = await fixture();
+  try {
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    const links = f.host.guestLinks;
+    const first = await links.create('First PIN', true);
+    assert.match(first.pin!, /^[0-9]{4}$/);
+    assert.deepEqual(links.revealPin(first.id), {
+      pin: first.pin,
+      expires: first.pinExpires,
+    });
+    assert.equal(
+      links.list().find((link) => link.id === first.id)?.pinExpires,
+      first.pinExpires,
+    );
+    assert.ok(
+      links.list().every((link) => !('pin' in link) && !('code' in link)),
+    );
+    const replacement = await links.create('Replacement PIN', true);
+    assert.notEqual(replacement.pin, first.pin);
+    assert.throws(() => links.revealPin(first.id), /No unused/);
+    assert.throws(() => links.exchangePin(first.pin!), /incorrect, expired/);
+    const access = links.exchangePin(replacement.pin!);
+    assert.throws(() => links.revealPin(replacement.id), /No unused/);
+    assert.equal(access.expires, replacement.expires);
+    assert.equal(links.require(access.session).id, replacement.id);
+    assert.throws(() => links.exchangePin(replacement.pin!), /already used/);
+    const expires = await links.create('Expires unused', true);
+    t.mock.timers.tick(GUEST_PIN_LIFETIME);
+    assert.throws(() => links.revealPin(expires.id), /No unused/);
+    assert.ok(links.list().every((link) => link.pinExpires === undefined));
+    assert.throws(() => links.exchangePin(expires.pin!), /expired/);
+    assert.equal(links.require(access.session).id, replacement.id);
+    const revoked = await links.create('Revoked before use', true);
+    await links.revoke(revoked.id);
+    assert.throws(() => links.revealPin(revoked.id), /No unused/);
+    assert.throws(() => links.exchangePin(revoked.pin!), /revoked|incorrect/);
+    await links.revoke(replacement.id);
+    assert.equal(links.valid(access.session), undefined);
+    const restart = await links.create('Before restart', true);
+    const reopened = new GuestLinks(
+      await StateStore.open(f.store.directory, password),
+    );
+    assert.throws(() => reopened.revealPin(restart.id), /No unused/);
+    assert.throws(() => reopened.exchangePin(restart.pin!), /incorrect/);
+    assert.equal(
+      reopened.require(reopened.exchange(restart.token).session).id,
+      restart.id,
+    );
+    const stored = JSON.parse(
+      await readFile(path.join(f.store.directory, 'state.json'), 'utf8'),
+    );
+    assert.ok(
+      stored.guestLinks.every(
+        (link: Record<string, unknown>) =>
+          !('pin' in link) && !('pinHash' in link) && !('pinExpires' in link),
+      ),
+    );
+  } finally {
+    t.mock.timers.reset();
+    await f.close();
+  }
+});
+
+test('PIN reveal requires a local session, CSRF and host password and is unavailable in tunnel mode', async (t) => {
+  const f = await fixture();
+  let lan: Host | undefined;
+  try {
+    t.mock.method(os, 'networkInterfaces', () => ({
+      ethernet: [
+        {
+          address: '192.168.50.25',
+          netmask: '255.255.255.0',
+          family: 'IPv4',
+          mac: '00:11:22:33:44:55',
+          internal: false,
+          cidr: '192.168.50.25/24',
+        },
+      ],
+    }));
+    lan = new Host(f.store, { access: 'lan' });
+    const host = lan;
+    const invitation = await host.guestLinks.create('Reveal', true);
+    const url = `/api/guest-links/${invitation.id}/pin`;
+    const headers: Record<string, string> = { host: '127.0.0.1' };
+    const send = (body = { password }) =>
+      host.management.inject({
+        method: 'POST',
+        url,
+        headers,
+        payload: body,
+      });
+    assert.equal((await send()).statusCode, 401);
+    const login = await host.management.inject({
+      method: 'POST',
+      url: '/api/login',
+      headers,
+      payload: { password },
+    });
+    assert.equal(login.statusCode, 200);
+    headers.cookie = String(login.headers['set-cookie']).split(';')[0]!;
+    assert.equal((await send()).statusCode, 403);
+    headers['x-p2pfs-csrf'] = login.json<{ csrf: string }>().csrf;
+    assert.equal((await send({ password: 'wrong-password' })).statusCode, 403);
+    const revealed = await send();
+    assert.equal(revealed.statusCode, 200);
+    assert.deepEqual(revealed.json(), {
+      pin: invitation.pin,
+      expires: invitation.pinExpires,
+    });
+    assert.equal(revealed.headers['cache-control'], 'no-store');
+    assert.equal((await send()).statusCode, 200);
+    const snapshot = await host.management.inject({
+      url: '/api/state',
+      headers,
+    });
+    assert.ok(!snapshot.body.includes(`"pin":"${invitation.pin}"`));
+    host.guestLinks.exchangePin(invitation.pin!);
+    assert.equal((await send()).statusCode, 404);
+    assert.equal((await local(f.host, url, 'POST', { password })).status, 404);
+    assert.equal(
+      (
+        await fetch(f.host.transferUrl + url, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ password }),
+        })
+      ).status,
+      404,
+    );
+  } finally {
+    await lan?.close();
+    await f.close();
+  }
+});
+
+test('PIN guessing limits are host-wide, cancel the code and cannot be reset by issuing another', async (t) => {
+  const f = await fixture();
+  try {
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    const links = f.host.guestLinks;
+    let invitation = await links.create('Initial PIN', true);
+    const wrongPin = () =>
+      String((Number(invitation.pin) + 1) % 10_000).padStart(4, '0');
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (attempt === 2) invitation = await links.create('Rotated PIN', true);
+      assert.throws(() => links.exchangePin(wrongPin()), /incorrect/);
+    }
+    assert.throws(() => links.exchangePin(wrongPin()), /temporarily locked/);
+    assert.throws(
+      () => links.exchangePin(invitation.pin!),
+      /temporarily locked/,
+    );
+    const count = links.list().length;
+    await assert.rejects(
+      links.create('Cannot reset cooldown', true),
+      /temporarily locked/,
+    );
+    assert.equal(links.list().length, count);
+    const tokenAccess = links.exchange(invitation.token);
+    assert.equal(links.require(tokenAccess.session).id, invitation.id);
+    t.mock.timers.tick(GUEST_PIN_COOLDOWN - 1);
+    assert.throws(
+      () => links.exchangePin(invitation.pin!),
+      /temporarily locked/,
+    );
+    t.mock.timers.tick(1);
+    assert.throws(() => links.exchangePin(invitation.pin!), /incorrect/);
+    const fresh = await links.create('After cooldown', true);
+    assert.equal(
+      links.require(links.exchangePin(fresh.pin!).session).id,
+      fresh.id,
+    );
+  } finally {
+    t.mock.timers.reset();
+    await f.close();
+  }
+});
+
+test('failed PIN creation or revocation preserves the previous invitation', async (t) => {
+  const f = await fixture();
+  try {
+    const links = f.host.guestLinks;
+    const original = await links.create('Working PIN', true);
+    const save = t.mock.method(f.store, 'save', async () => {
+      throw new Error('Synthetic PIN persistence failure');
+    });
+    await assert.rejects(
+      links.create('Failed PIN', true),
+      /persistence failure/,
+    );
+    await assert.rejects(links.revoke(original.id), /persistence failure/);
+    assert.equal(links.list().length, 1);
+    save.mock.restore();
+    assert.equal(
+      links.require(links.exchangePin(original.pin!).session).id,
+      original.id,
     );
   } finally {
     await f.close();
@@ -944,6 +1380,7 @@ test('older item-specific guest links remain restricted after reopening persiste
     await f.host.close();
     const store = await StateStore.open(f.store.directory, password);
     restored = new Host(store, {
+      access: 'tunnel',
       transferPort: 0,
       managementPort: 0,
       transport: transport(),
@@ -1050,6 +1487,9 @@ test('password sessions reject wrong and expired credentials and throttle expens
   const concurrent = [limited.login(password), limited.login(password)];
   await assert.rejects(limited.login(password), /capacity/);
   await Promise.all(concurrent);
+  for (let index = 0; index < 18; index++)
+    assert.equal(await limited.verify('wrong-password'), false);
+  await assert.rejects(limited.verify(password), /capacity/);
 });
 
 test('tunnel URL validation rejects credentials, paths and private networks', () => {
@@ -1590,12 +2030,19 @@ test('host configuration controls provider selection and rejects invalid edits w
     await f.host.close();
     const config = path.join(f.store.directory, 'host.json');
     assert.deepEqual(JSON.parse(await readFile(config, 'utf8')), {
+      access: 'lan',
       provider: 'ngrok',
     });
     await writeFile(config, '{"provider":"devtunnel"}\n');
     const reopened = await StateStore.open(f.store.directory, password);
     assert.equal(reopened.state.provider, 'devtunnel');
+    assert.equal(reopened.access, 'lan');
     assert.equal(await readFile(config, 'utf8'), '{"provider":"devtunnel"}\n');
+    await writeFile(config, '{"access":"tunnel","provider":"devtunnel"}\n');
+    assert.equal(
+      (await StateStore.open(f.store.directory, password)).access,
+      'tunnel',
+    );
     const stateFile = path.join(f.store.directory, 'state.json');
     const saved = await readFile(stateFile, 'utf8');
     for (const invalid of [
@@ -1604,6 +2051,19 @@ test('host configuration controls provider selection and rejects invalid edits w
       '{"provider":"unknown"}',
       '{"provider":["ngrok"]}',
       '{"provider":"zrok","typo":true}',
+      '{"access":"public"}',
+      '{"access":false}',
+      '{"lanAddress":null}',
+      '{"lanAddress":"0.0.0.0"}',
+      '{"lanAddress":"127.0.0.1"}',
+      '{"lanAddress":"8.8.8.8"}',
+      '{"guestUrl":null}',
+      '{"guestUrl":"not a URL"}',
+      '{"guestUrl":"file:///tmp/guest"}',
+      '{"guestUrl":"http://user:password@home.arpa/apps/p2pfs"}',
+      '{"guestUrl":"http://home.arpa/apps/p2pfs?token=secret"}',
+      '{"guestUrl":"http://home.arpa/apps/p2pfs#token=secret"}',
+      '{"guestUrl":"http://home.arpa/apps/%22unsafe%22"}',
     ]) {
       await writeFile(config, invalid);
       await assert.rejects(
@@ -1616,6 +2076,135 @@ test('host configuration controls provider selection and rejects invalid edits w
   } finally {
     await f.close();
   }
+});
+
+test('LAN configuration accepts only a private IPv4 address assigned to a network interface', async (t) => {
+  const address = '192.168.50.25';
+  t.mock.method(
+    os,
+    'networkInterfaces',
+    (): ReturnType<typeof os.networkInterfaces> => ({
+      ethernet: [
+        {
+          address,
+          netmask: '255.255.255.0',
+          family: 'IPv4',
+          mac: '00:00:00:00:00:00',
+          internal: false,
+          cidr: `${address}/24`,
+        },
+      ],
+    }),
+  );
+  assert.equal(lanAddress(address), address);
+  for (const invalid of [
+    '0.0.0.0',
+    '127.0.0.1',
+    '8.8.8.8',
+    '::1',
+    '192.168.50.25:7331',
+    'http://192.168.50.25',
+  ])
+    assert.throws(() => lanAddress(invalid), /private IPv4/);
+  assert.throws(
+    () => lanAddress('192.168.50.26'),
+    /not assigned to this computer/,
+  );
+  const f = await fixture();
+  try {
+    const config = path.join(f.store.directory, 'host.json');
+    await writeFile(config, JSON.stringify({ lanAddress: address }));
+    const reopened = await StateStore.open(f.store.directory, password);
+    assert.equal(reopened.lanAddress, address);
+    assert.equal(reopened.state.provider, 'ngrok');
+    assert.throws(
+      () =>
+        new Host(reopened, {
+          publicUrl: 'https://example.ngrok.app',
+          lanAddress: address,
+        }),
+      /cannot be combined/,
+    );
+    await writeFile(
+      config,
+      JSON.stringify({ provider: 'zrok', lanAddress: address }),
+    );
+    const withProvider = await StateStore.open(f.store.directory, password);
+    assert.equal(withProvider.lanAddress, address);
+    assert.equal(withProvider.state.provider, 'zrok');
+    const saved = await readFile(
+      path.join(f.store.directory, 'state.json'),
+      'utf8',
+    );
+    await writeFile(config, JSON.stringify({ lanAddress: '192.168.50.26' }));
+    const unavailable = await StateStore.open(f.store.directory, password);
+    assert.throws(() => new Host(unavailable), /not assigned/);
+    assert.equal(
+      await readFile(path.join(f.store.directory, 'state.json'), 'utf8'),
+      saved,
+    );
+    await writeFile(config, '{"provider":"zrok"}');
+    assert.equal(
+      (await StateStore.open(f.store.directory, password)).lanAddress,
+      undefined,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test('default LAN address selection prefers a network interface over a point-to-point interface and never uses a public or loopback address', (t) => {
+  let interfaces: ReturnType<typeof os.networkInterfaces> = {
+    loopback: [
+      {
+        address: '127.0.0.1',
+        netmask: '255.0.0.0',
+        family: 'IPv4',
+        mac: '00:00:00:00:00:00',
+        internal: true,
+        cidr: '127.0.0.1/8',
+      },
+    ],
+    vpn: [
+      {
+        address: '10.10.10.10',
+        netmask: '255.255.255.255',
+        family: 'IPv4',
+        mac: '00:00:00:00:00:00',
+        internal: false,
+        cidr: '10.10.10.10/32',
+      },
+    ],
+    ethernet: [
+      {
+        address: '192.168.8.100',
+        netmask: '255.255.255.0',
+        family: 'IPv4',
+        mac: '00:11:22:33:44:55',
+        internal: false,
+        cidr: '192.168.8.100/24',
+      },
+    ],
+  };
+  t.mock.method(os, 'networkInterfaces', () => interfaces);
+  assert.equal(lanAddress(), '192.168.8.100');
+  assert.equal(lanAddress('10.10.10.10'), '10.10.10.10');
+  interfaces = { loopback: interfaces.loopback, vpn: interfaces.vpn };
+  assert.equal(lanAddress(), '10.10.10.10');
+  interfaces = {
+    loopback: interfaces.loopback,
+    public: [
+      {
+        address: '8.8.8.8',
+        netmask: '255.255.255.0',
+        family: 'IPv4',
+        mac: '00:11:22:33:44:55',
+        internal: false,
+        cidr: '8.8.8.8/24',
+      },
+    ],
+  };
+  assert.throws(() => lanAddress(), /No private IPv4.*--tunnel/);
 });
 
 test('dashboard starts only the configured provider and cannot override it', async () => {
@@ -1723,7 +2312,7 @@ test('legacy state migrates without losing content, link restrictions or unrelat
       JSON.parse(
         await readFile(path.join(f.store.directory, 'host.json'), 'utf8'),
       ),
-      { provider: 'zrok' },
+      { access: 'lan', provider: 'zrok' },
     );
     assert.deepEqual(store.state.allowedHosts, previous.allowedHosts);
     assert.deepEqual(store.state.shares, previous.shares);
@@ -1752,6 +2341,7 @@ test('legacy state migrates without losing content, link restrictions or unrelat
       'Already downloaded',
     );
     restored = new Host(store, {
+      access: 'tunnel',
       managementPort: 0,
       transferPort: 0,
       transport: transport(),

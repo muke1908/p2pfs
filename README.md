@@ -5,11 +5,13 @@ private browser link.
 
 ![A host shares files and a live whitepad through an HTTPS tunnel; the receiver opens a private browser link.](docs/images/sharing-flow.svg)
 
-**Host:** run the publisher locally and create a tunnel.  
+**Host:** run the publisher locally using a tunnel or your local network.
+
 **Receiver:** open the private link in a browser. Nothing to install or run.
 
 There is no registry, peer discovery, receiver application, or central file
-store. The host serves the content; the tunnel provider relays the connection.
+store. The host serves the content directly on your LAN, or through a tunnel
+provider that relays the connection.
 
 ## A look inside
 
@@ -36,17 +38,9 @@ _Screenshots use demo content. No real files, passwords, or private links are sh
 
 ## Start the host
 
-The host needs **Node.js 24.13 or newer**, npm, and an installed, authenticated
-tunnel provider. Receivers only need a modern browser.
-
-Configure one provider using its official setup instructions:
-
-- **ngrok** (default): install the agent and configure your account credentials.
-- **Microsoft Dev Tunnels:** install `devtunnel`, then run `devtunnel user login`.
-- **zrok:** install `zrok` or `zrok2`, then enable your environment with your
-  provider's enable token.
-
-The app does not install provider CLIs or create accounts.
+The host needs **Node.js 24.13 or newer** and npm. Receivers only need a modern
+browser. **Local network sharing is the default**; no tunnel installation or
+account is needed.
 
 ```sh
 npm ci
@@ -56,32 +50,156 @@ npm run publisher
 Enter a **host password of at least 12 characters** at the hidden prompt. This
 password protects local management; do not send it to recipients.
 
-The command builds the app, starts the local server, and starts the configured
-tunnel. Provider selection lives in the host's **`host.json`** configuration
-file, not in the dashboard. Open the printed **local dashboard URL** and unlock it with
-the host password. Keep the terminal running; **Ctrl+C** shuts down the host and
-its app-owned tunnel.
+The command builds the app, automatically selects a private local IPv4 address,
+and starts LAN sharing. Open the printed **local dashboard URL**, unlock it with
+the host password, and create a PIN under **Guest links**. Keep the terminal
+running; **Ctrl+C** shuts down the host.
 
-### Configure the host
+### Local network sharing
 
-Install and authenticate your tunnel provider **before starting the publisher**.
-The publisher always starts a tunnel (or verifies your externally managed one).
-If no `host.json` exists, it creates one using ngrok for a new installation
-or the previously selected provider for an existing installation.
+Running `npm run publisher` starts local sharing automatically, including
+through the Mac menu-bar app. The address selector prefers interfaces with a
+nonzero hardware address over point-to-point interfaces, then uses the first
+available private IPv4 address. Check the printed **LAN endpoint**. If you
+have several networks or want to choose a specific interface, use:
+
+```sh
+npm run publisher -- --lan 192.168.8.100
+```
+
+Replace the example with the host's actual address, shown in your operating
+system's network settings or your router's connected-device list. On macOS,
+`ipconfig getifaddr en0` commonly shows the Wi-Fi address; your interface may
+differ. The address must belong to an active, non-loopback interface on this
+computer and be in `10.x.x.x`, `172.16.x.x` through `172.31.x.x`, or
+`192.168.x.x`. IPv6-only LAN sharing is not supported.
+
+To save a specific address, put this in the state directory's **`host.json`**,
+then restart:
+
+```json
+{
+  "access": "lan",
+  "lanAddress": "192.168.8.100"
+}
+```
+
+LAN mode starts no tunnel and needs no provider CLI, public/static IP, internet
+connection, or router port forwarding. The content server listens only on the
+chosen address (port `7331` by default); the password-protected management
+dashboard stays on localhost at port `7332`.
+
+Open **Guest links**, name the session, and choose **Create PIN**. The guest
+opens the short address shown, such as `http://192.168.8.100:7331/receive`,
+and enters the **4-digit PIN**. No long token needs to be copied. **Copy join
+details** copies the address and PIN together.
+
+The PIN works **once** and expires after **5 minutes**. To see it again, choose
+**Show PIN** under **Issued links** and confirm your host password (at least
+12 characters). Only the latest unused, unexpired PIN can be revealed; showing
+it does not reset its expiry. Creating another PIN replaces any unused PIN on this host, without
+disconnecting guests who already joined. Five incorrect PIN attempts within
+one minute cancel the PIN and lock PIN joining and creation for **60 seconds**
+across all devices. Creating a new session cannot bypass that cooldown.
+
+After joining, the browser uses a strong random HttpOnly session cookie, not
+the PIN, for file downloads, folder browsing, previews, and live whitepad
+updates. Access lasts until the guest session's original **24-hour expiry**,
+revocation, sign-out, or host restart; PIN expiry does not disconnect joined
+guests. PINs are kept only in process memory, never on disk, and do not survive a restart.
+Ask the host for a new PIN to join again. Existing full token links still work,
+but PIN joining is available **only in LAN mode**, never through a public tunnel.
+
+**LAN links use unencrypted HTTP.** Files, text, and access tokens are not
+encrypted in transit; use only a trusted network. On HTTP receiver pages, use
+**Select text to copy** and your normal copy action instead of the
+secure-context-only clipboard button.
+
+Devices must be able to reach each other. Allow the content port through the
+host firewall for your private network if needed; guest Wi-Fi, client/AP
+isolation, or separate VLANs may block access. Do not forward either app port
+from the internet. A router DHCP reservation keeps the host address stable.
+If it changes, restart to auto-detect the new address, or update your fixed
+address, and create new join details. The host must remain awake and connected.
+
+`--lan` overrides the saved mode and LAN address for that run without saving it.
+A `provider` may remain in `host.json` but is not used in LAN mode. Missing
+`access`, including in older provider-only configurations, defaults to `lan`.
+Use `--tunnel` or save `"access": "tunnel"` to opt into public tunneling.
+`--public-url` also explicitly selects public access; it cannot be combined
+with `--lan`. If no private IPv4 interface is available, LAN startup stops with
+an error rather than starting a public tunnel.
+
+### LAN reverse proxy and a friendly guest URL
+
+To serve only the guest receiver through an existing LAN reverse proxy, add
+`guestUrl` to the state directory's `host.json` and restart the publisher:
+
+```json
+{
+  "access": "lan",
+  "guestUrl": "http://mukecz.home.arpa/apps/p2pfs"
+}
+```
+
+`--guest-url <url>` overrides this setting for one run. The Mac app reads the
+same `host.json`; rebuilding the native launcher is not needed. The URL must
+be HTTP or HTTPS, optionally followed by simple path segments, without
+credentials, query parameters, or a fragment. This setting applies only in
+LAN mode; tunnel mode continues to use its verified public endpoint.
+
+Configure the proxy to reach the publisher's **actual LAN address and transfer
+port**, preserve the request's **Host header and path prefix**, and forward only
+the receiver page, its scripts, and guest endpoints. For the example above,
+these paths are `/apps/p2pfs/`, `/apps/p2pfs/receive`,
+`/apps/p2pfs/receive.js`, `/apps/p2pfs/shares/preview-ui.js`, and
+`/apps/p2pfs/guest/*`. Do not proxy port `7332` or management endpoints.
+
+The receiver opens at `/apps/p2pfs/`; generated invitations use
+`/apps/p2pfs/receive`. Scripts, previews, downloads, live updates, and session
+cookies stay under the configured prefix. The configured external Host/Origin
+is explicitly trusted for that prefix; arbitrary hosts and cross-site requests
+are still rejected. The normal LAN-IP receiver remains available with its
+original cookie path. PINs and private links are still required. Use only a
+trusted LAN, and do not expose the proxy to the internet.
+
+### Configure the tunnel host
+
+For internet sharing, install and authenticate one provider using its official
+setup instructions:
+
+- **ngrok** (default tunnel provider): install the agent and configure your
+  account credentials.
+- **Microsoft Dev Tunnels:** install `devtunnel`, then run `devtunnel user login`.
+- **zrok:** install `zrok` or `zrok2`, then enable your environment with your
+  provider's enable token.
+
+The app does not install provider CLIs or create accounts. Start explicitly in
+tunnel mode:
+
+```sh
+npm run publisher -- --tunnel
+```
+
+In tunnel mode, the publisher always starts a tunnel (or verifies your
+externally managed one). A new `host.json` defaults to `"access": "lan"` and
+retains the previously selected provider, or ngrok for a new installation.
 
 To choose a provider before the first run, create `host.json` in your state
 directory:
 
 ```json
 {
+  "access": "tunnel",
   "provider": "ngrok"
 }
 ```
 
-Allowed values are `ngrok`, `devtunnel`, and `zrok`. **Restart the publisher**
-after editing. The file is read at startup; dashboard start/stop buttons use
-that configuration and cannot change it. Invalid configuration stops startup
-with an error rather than silently choosing another provider.
+Allowed providers are `ngrok`, `devtunnel`, and `zrok`. Setting `provider`
+alone does not enable tunneling. **Restart the publisher** after editing.
+The file is read at startup; dashboard tunnel start/stop buttons use that
+provider and cannot change the connection mode. Invalid configuration stops
+startup with an error rather than silently choosing another provider.
 
 For example, create `./host-state/host.json` with the contents above, then run:
 
@@ -96,8 +214,8 @@ directory, which also holds private runtime data.
 
 If tunnel startup fails, the publisher exits and cleans up its listeners and
 app-owned tunnel processes. Fix the reported installation, login, configuration,
-or quota issue, then run `npm run publisher` again. There is no local-only
-startup mode or automatic failover to a different provider.
+or quota issue, then run the publisher in tunnel mode again. There is no
+automatic failover to another provider or to LAN sharing.
 
 ## Share content and send a link
 
@@ -107,18 +225,20 @@ startup mode or automatic failover to a different provider.
    path. Use **Text** to
    write in the single **Whitepad**. It saves and streams automatically as you
    type, with no title or publish button.
-2. Open **Guest links**, name the session, and choose **Create session link**.
-   You can create a link before sharing any content.
-3. Choose **Copy session link** and send the **entire URL**, including its
-   `#token=...` fragment, privately to the recipient.
+2. Open **Guest links**, name the session, and choose **Create PIN** in LAN
+   mode or **Create session link** in tunnel mode. You can do this before
+   sharing any content.
+3. For LAN sharing, send the short receiving address and PIN using **Copy join
+   details**. For tunneled sharing, choose **Copy session link** and send the
+   **entire URL**, including its `#token=...` fragment, privately.
 
 A session link covers **all current and future files, folders, and text you
 explicitly share from this host**. Add or remove content without issuing a new
 link: recipients see changes live, without refreshing. Unshared local content
 is never included.
 
-Do not send the bare tunnel endpoint or the local dashboard URL. Only the
-private receiving link grants browser access.
+Do not send the bare tunnel endpoint or the local dashboard URL. Guests need
+either a valid LAN PIN or the complete private receiving link to gain access.
 
 ### Dropping files
 
@@ -141,11 +261,14 @@ disk space; there is no cloud upload or central file store.
 ### Image previews
 
 Supported images have compact thumbnails in the host's share list and in the
-recipient's file lists, including images inside shared folders. Downloads still
+recipient's file lists, including images inside shared folders. Click a thumbnail
+to open the full-size image in a new tab. Downloads still
 contain the **unmodified original file**.
 
 Previews are generated locally as WebP thumbnails up to **128 × 128 pixels**,
-without image metadata. They use the same authenticated access and link scope
+without image metadata. Full-size views are decoded locally as PNG at their
+original pixel dimensions (with orientation applied and metadata removed);
+animated images show their first frame. Both views use the same authenticated access and link scope
 as downloads and are not stored in a persistent thumbnail cache. JPEG, PNG,
 WebP, GIF (first frame), AVIF, and TIFF are attempted for files up to **20 MiB**
 and **40 megapixels**. Unsupported, corrupt, or oversized images keep their
@@ -154,8 +277,9 @@ a file.
 
 ## Receive in a browser
 
-Open the link. There is no account, password prompt, Node installation, tunnel
-tool, or local receiver server.
+Open the link. In LAN mode, enter the 4-digit PIN from the host when joining
+through the short receiving address. There is no account, host-password
+prompt, Node installation, tunnel tool, or local receiver server.
 
 - **Standalone file:** choose **Download** directly, without opening a
   one-item collection.
@@ -169,7 +293,7 @@ file in JavaScript. The browser controls progress, cancellation, save location,
 and filename collisions. Folder downloads are individual files, not ZIP
 archives; no local folder tree or automatic synchronization is created.
 
-The host and tunnel must stay online. Some providers display a browser
+The host and its network connection (or tunnel) must stay online. Some providers display a browser
 confirmation page before opening the receiving page. An interrupted download
 must be restarted; resumable transfers are not implemented.
 
@@ -190,8 +314,8 @@ Stopping a share also blocks its new reads and cancels its active transfers.
 Neither action can recall files already saved or text already copied.
 
 Browser sessions end when the host restarts. Reopen the original link if it is
-still valid and the public URL is unchanged. If the tunnel URL changes, create
-and send a new link.
+still valid and the sharing URL is unchanged, or ask for a fresh LAN PIN.
+If the tunnel URL or LAN address changes, create and send new join details.
 
 ## Files, folders, and text
 
@@ -226,7 +350,8 @@ errors are shown rather than silently ignored.
 ## Native Mac app
 
 Use the lightweight **menu-bar app** instead of leaving a terminal open.
-Opening it starts sharing; **Quit p2pfs** stops its publisher and tunnel.
+Opening it starts LAN sharing by default; **Quit p2pfs** stops its publisher
+and any app-owned tunnel.
 There is no login item, automatic restart, or background service.
 
 Build on macOS with Xcode Command Line Tools installed:
@@ -257,12 +382,14 @@ npm run app:build -- --state-dir ./host-state
 
 You can move `dist/p2pfs.app` into Applications. This is a local launcher, not a
 self-contained distribution: keep this checkout (including `node_modules` and
-`dist`), Node, and your authenticated tunnel CLI installed. The build records
+`dist`) and Node installed. An authenticated tunnel CLI is needed only for
+tunnel mode. The build records
 their local paths and your `PATH` so Finder launches do not depend on shell
 profiles. Rebuild and replace the app after moving the checkout, changing Node,
 or changing your tunnel CLI's location. Run without sudo.
 
-Quit and reopen after changing `host.json`. Your shares, whitepad, and guest
+Quit and reopen after changing `host.json`, including `lanAddress` for LAN
+sharing. No tunnel is started in LAN mode. Your shares, whitepad, and guest
 link settings remain in the state directory. Removing the app does not delete
 them. Your Mac must stay awake and connected; the app does not prevent sleep
 or bypass provider authentication and quotas. A restarted tunnel may get a new
@@ -275,14 +402,17 @@ npm run publisher -- --help
 npm run publisher -- --name "My host" --state-dir ./host-state
 ```
 
-The public-content listener and management dashboard both bind to loopback:
+In tunnel mode, both listeners bind to loopback. In LAN mode, only the content
+listener binds to the selected private IPv4 address:
 
-| Option              | Default                                | Purpose                                           |
-| ------------------- | -------------------------------------- | ------------------------------------------------- |
-| `--transfer-port`   | `7331`                                 | Read-only content behind the tunnel               |
-| `--management-port` | `7332`                                 | Local host dashboard; never forward this port     |
-| `--state-dir`       | Per-user OS application-data directory | Publisher settings and shared-content definitions |
-| `--name`            | Hostname on first start                | Display name shown to recipients                  |
+| Option              | Default                                | Purpose                                              |
+| ------------------- | -------------------------------------- | ---------------------------------------------------- |
+| `--transfer-port`   | `7331`                                 | Read-only content on the selected connection         |
+| `--management-port` | `7332`                                 | Local host dashboard; never forward this port        |
+| `--state-dir`       | Per-user OS application-data directory | Publisher settings and shared-content definitions    |
+| `--name`            | Hostname on first start                | Display name shown to recipients                     |
+| `--lan <ipv4>`      | Automatic private IPv4 selection       | Choose a specific LAN interface without a tunnel     |
+| `--tunnel`          | Not set                                | Opt into the configured public tunnel instead of LAN |
 
 Use separate state directories and ports if running multiple publishers.
 For automation, `--password-stdin` reads the host password from standard input.
@@ -345,10 +475,11 @@ minimal health probe. Local management remains on its separate loopback port
 with password authentication, Host/Origin checks, and CSRF protection. A guest
 cookie cannot manage the host.
 
-This is **not relay-free or end-to-end encrypted against the tunnel provider**.
-Providers relay traffic and may terminate TLS. Trust the provider with content
-and traffic it can observe. Links are bearer access, not individual-user
-permissions.
+LAN mode connects directly but uses **unencrypted HTTP**; trust the local
+network. Tunnel mode is **not relay-free or end-to-end encrypted against the
+tunnel provider**: providers relay traffic and may terminate TLS. Trust the
+provider with content and traffic it can observe. PINs and links grant bearer
+access, not individual-user permissions.
 
 Source metadata is checked before/during streaming; cryptographic file-content
 verification is not implemented. Local filesystem mutation by a privileged

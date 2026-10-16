@@ -15,7 +15,7 @@ const directory = path.join(root, 'host');
 await mkdir(directory);
 await writeFile(
   path.join(directory, 'host.json'),
-  JSON.stringify({ provider }),
+  JSON.stringify({ access: 'tunnel', provider }),
 );
 const store = await StateStore.open(
   directory,

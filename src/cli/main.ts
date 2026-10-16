@@ -1,8 +1,9 @@
 #!/usr/bin/env node
-import { Command, InvalidArgumentError } from 'commander';
+import { Command, InvalidArgumentError, Option } from 'commander';
 import { open, readFile, rm, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { StateStore, defaultStateDir, isMissing } from '../config/state.js';
+import { lanAddress, parseGuestUrl } from '../config/network.js';
 import { Host } from '../host/app.js';
 import { AppError } from '../security/auth.js';
 import { publicUrl, Transport } from '../security/transport.js';
@@ -15,6 +16,9 @@ interface StartOptions {
   passwordStdin?: boolean;
   publicUrl?: string;
   allowHost?: string[];
+  lan?: string;
+  tunnel?: boolean;
+  guestUrl?: string;
 }
 
 function port(input: string): number {
@@ -156,12 +160,15 @@ async function start(options: StartOptions): Promise<void> {
     const store = await StateStore.open(directory, password, initial);
     startup.signal.throwIfAborted();
     console.log(
-      `Host configuration: ${path.join(directory, 'host.json')} (edit and restart to change provider)`,
+      `Host configuration: ${path.join(directory, 'host.json')} (edit and restart to change connection settings)`,
     );
     host = new Host(store, {
       managementPort: options.managementPort,
       transferPort: options.transferPort,
       publicUrl: options.publicUrl,
+      lanAddress: options.lan,
+      access: options.tunnel ? 'tunnel' : undefined,
+      guestUrl: options.guestUrl,
     });
     await host.listen();
     startup.signal.throwIfAborted();
@@ -175,7 +182,7 @@ async function start(options: StartOptions): Promise<void> {
       if (!process.connected || !process.send) return;
       process.send(
         {
-          status: host!.tunnel.status,
+          status: host!.state().tunnel.status,
           dashboard: host!.managementUrl,
         },
         (error) => {
@@ -187,7 +194,12 @@ async function start(options: StartOptions): Promise<void> {
       statusTimer = setInterval(report, 1000);
       report();
     }
-    if (options.publicUrl) {
+    if (host.state().access === 'lan') {
+      console.log(`LAN endpoint: ${host.transferUrl}`);
+      console.error(
+        'LAN sharing uses unencrypted HTTP. Only share on a trusted private network. No tunnel is started.',
+      );
+    } else if (options.publicUrl) {
       const transport = new Transport();
       const health = await transport.json<{ id: string; protocol: number }>(
         options.publicUrl,
@@ -222,7 +234,9 @@ async function start(options: StartOptions): Promise<void> {
 
 const cli = new Command()
   .name('p2pfs')
-  .description('Publish local files and text through private browser links')
+  .description(
+    'Share local files and text on your LAN by default, or through an explicit tunnel',
+  )
   .version('0.1.0')
   .allowExcessArguments(false)
   .option(
@@ -241,7 +255,21 @@ const cli = new Command()
     start(current.opts<StartOptions>()),
   );
 cli
-  .option('--transfer-port <port>', 'Loopback transfer port', port, 7331)
+  .option('--transfer-port <port>', 'Content server port', port, 7331)
+  .option(
+    '--guest-url <url>',
+    'LAN reverse proxy guest address, including an optional path prefix',
+    parseGuestUrl,
+  )
+  .addOption(
+    new Option(
+      '--lan <ipv4>',
+      'Choose a private LAN IPv4 address (default: auto-detected)',
+    )
+      .argParser(lanAddress)
+      .conflicts(['tunnel', 'publicUrl']),
+  )
+  .option('--tunnel', 'Use the configured public tunnel instead of LAN sharing')
   .option(
     '--public-url <url>',
     'Use an externally managed, verified HTTPS endpoint',

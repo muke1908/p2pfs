@@ -18,7 +18,11 @@ export class Previews {
 
   constructor(private shares: Shares) {}
 
-  async create(shareId: string, fileId: string): Promise<Buffer> {
+  async create(
+    shareId: string,
+    fileId: string,
+    fullSize = false,
+  ): Promise<Buffer> {
     if (this.waiting.length >= 100)
       throw new AppError(429, 'Image previews are busy; try again shortly.');
     if (this.active >= 2)
@@ -50,14 +54,17 @@ export class Previews {
             )
           )
             throw new Error('Unsupported image format.');
-          const preview = await image
-            .rotate()
-            .resize(128, 128, {
-              fit: 'inside',
-              withoutEnlargement: true,
-            })
-            .webp({ quality: 70 })
-            .toBuffer();
+          image.rotate();
+          const preview = await (
+            fullSize
+              ? image.png()
+              : image
+                  .resize(128, 128, {
+                    fit: 'inside',
+                    withoutEnlargement: true,
+                  })
+                  .webp({ quality: 70 })
+          ).toBuffer();
           this.shares.requireFile(shareId, fileId);
           return preview;
         } catch (error) {

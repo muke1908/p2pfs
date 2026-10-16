@@ -1,4 +1,7 @@
 import { Tunnel } from '../src/tunnels/manager.js';
+import os from 'node:os';
+
+if (process.env.P2PFS_TEST_NO_LAN) os.networkInterfaces = () => ({});
 
 // Preloaded only by CLI tests; no provider process or public connection is used.
 Tunnel.prototype.start = async function (provider, port) {

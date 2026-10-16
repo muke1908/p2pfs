@@ -47,6 +47,14 @@ export class Sessions {
   ) {}
 
   async login(password: string): Promise<string> {
+    if (!(await this.verify(password)))
+      throw new AppError(401, 'Invalid password.');
+    const token = secret();
+    this.entries.set(digest(token), Date.now() + this.lifetime);
+    return token;
+  }
+
+  async verify(password: string): Promise<boolean> {
     const now = Date.now();
     this.attempts = this.attempts.filter((time) => now - time < 60_000);
     this.prune();
@@ -59,11 +67,7 @@ export class Sessions {
     this.attempts.push(now);
     this.active++;
     try {
-      if (!(await verifyPassword(password, this.verifier)))
-        throw new AppError(401, 'Invalid password.');
-      const token = secret();
-      this.entries.set(digest(token), Date.now() + this.lifetime);
-      return token;
+      return await verifyPassword(password, this.verifier);
     } finally {
       this.active--;
     }

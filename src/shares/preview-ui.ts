@@ -6,6 +6,11 @@ export function addPreview(
   url: string,
 ): void {
   if (!file.preview) return;
+  const link = document.createElement('a');
+  link.href = `${url}/image`;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  link.setAttribute('aria-label', `Open ${file.name} full size in a new tab`);
   const image = document.createElement('img');
   image.className = 'thumbnail';
   image.width = 48;
@@ -17,10 +22,11 @@ export function addPreview(
     container.classList.add('has-preview');
   });
   image.addEventListener('error', () => {
-    image.remove();
+    link.remove();
     container.title =
       'Preview unavailable. The original file can still be downloaded.';
   });
-  image.src = url;
-  container.prepend(image);
+  image.src = `${url}/preview`;
+  link.append(image);
+  container.prepend(link);
 }

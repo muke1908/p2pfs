@@ -16,8 +16,10 @@ import {
   type GuestLink,
 } from '../guest/access.js';
 import { AppError, passwordHash, verifyPassword } from '../security/auth.js';
+import { isPrivateIPv4, parseGuestUrl } from './network.js';
 
 export type Provider = 'devtunnel' | 'ngrok' | 'zrok';
+export type Access = 'lan' | 'tunnel';
 export interface ShareDefinition {
   id: string;
   path: string;
@@ -46,15 +48,20 @@ export function defaultStateDir(): string {
   return path.join(base, 'p2pfs');
 }
 
-async function configuredProvider(
+async function configuredHost(
   directory: string,
   previous: Provider,
-): Promise<Provider> {
+): Promise<{
+  provider: Provider;
+  access: Access;
+  lanAddress?: string;
+  guestUrl?: string;
+}> {
   const filename = path.join(directory, 'host.json');
   try {
     await writeFile(
       filename,
-      `${JSON.stringify({ provider: previous }, null, 2)}\n`,
+      `${JSON.stringify({ access: 'lan', provider: previous }, null, 2)}\n`,
       {
         mode: 0o600,
         flag: 'wx',
@@ -76,16 +83,60 @@ async function configuredProvider(
     !config ||
     typeof config !== 'object' ||
     Array.isArray(config) ||
-    Object.keys(config).length !== 1 ||
-    !('provider' in config) ||
-    (config.provider !== 'devtunnel' &&
-      config.provider !== 'ngrok' &&
-      config.provider !== 'zrok')
+    Object.keys(config).some(
+      (key) => !['access', 'provider', 'lanAddress', 'guestUrl'].includes(key),
+    ) ||
+    Object.keys(config).length === 0 ||
+    ('lanAddress' in config && typeof config.lanAddress !== 'string') ||
+    ('guestUrl' in config && typeof config.guestUrl !== 'string')
   )
     throw new Error(
-      `Invalid host configuration ${filename}: use an object with only "provider" set to "ngrok", "devtunnel", or "zrok".`,
+      `Invalid host configuration ${filename}: use "access" ("lan" or "tunnel"), optional "provider" ("ngrok", "devtunnel", or "zrok"), optional "lanAddress" (a private IPv4 address), and optional "guestUrl" (the LAN reverse proxy's HTTP(S) address and path prefix). No other fields are allowed.`,
     );
-  return config.provider;
+  let access: Access = 'lan';
+  if ('access' in config) {
+    if (config.access !== 'lan' && config.access !== 'tunnel')
+      throw new Error(
+        `Invalid host configuration ${filename}: "access" must be "lan" or "tunnel".`,
+      );
+    access = config.access;
+  }
+  let provider = previous;
+  if ('provider' in config) {
+    if (
+      config.provider !== 'devtunnel' &&
+      config.provider !== 'ngrok' &&
+      config.provider !== 'zrok'
+    )
+      throw new Error(
+        `Invalid host configuration ${filename}: "provider" must be "ngrok", "devtunnel", or "zrok".`,
+      );
+    provider = config.provider;
+  }
+  let address: string | undefined;
+  if ('lanAddress' in config && typeof config.lanAddress === 'string') {
+    if (!isPrivateIPv4(config.lanAddress))
+      throw new Error(
+        `Invalid host configuration ${filename}: "lanAddress" must be a private IPv4 address.`,
+      );
+    address = config.lanAddress;
+  }
+  let guestUrl: string | undefined;
+  if ('guestUrl' in config && typeof config.guestUrl === 'string') {
+    try {
+      guestUrl = parseGuestUrl(config.guestUrl);
+    } catch (error) {
+      throw new Error(
+        `Invalid host configuration ${filename}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  return {
+    provider,
+    access,
+    lanAddress: address,
+    guestUrl,
+  };
 }
 
 export class StateStore {
@@ -93,6 +144,9 @@ export class StateStore {
   constructor(
     readonly directory: string,
     readonly state: State,
+    readonly lanAddress?: string,
+    readonly access: Access = 'lan',
+    readonly guestUrl?: string,
   ) {}
 
   static async open(
@@ -135,9 +189,16 @@ export class StateStore {
         provider: 'ngrok',
       };
     }
-    state.provider = await configuredProvider(directory, state.provider);
+    const config = await configuredHost(directory, state.provider);
+    state.provider = config.provider;
     Object.assign(state, initial);
-    const store = new StateStore(directory, state);
+    const store = new StateStore(
+      directory,
+      state,
+      config.lanAddress,
+      config.access,
+      config.guestUrl,
+    );
     await store.save();
     return store;
   }

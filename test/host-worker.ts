@@ -7,6 +7,7 @@ const directory = process.argv[2]!;
 const password = 'test-password-not-a-secret';
 const store = await StateStore.open(path.join(directory, 'state'), password);
 const host = new Host(store, {
+  access: 'tunnel',
   transferPort: 0,
   managementPort: 0,
   transport: new Transport({ testLoopback: true }),

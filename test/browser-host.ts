@@ -15,6 +15,7 @@ const store = await StateStore.open(path.join(directory, 'host'), password, {
   name: 'Synthetic source',
 });
 const host = new Host(store, {
+  access: 'tunnel',
   transferPort: 17343,
   managementPort: 17344,
   transport: new Transport({ testLoopback: true }),

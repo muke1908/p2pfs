@@ -23,6 +23,8 @@ const write = (id: string, text: string) => {
 };
 const message = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
+const pinJoin = !el('pin-form').hidden;
+const guestBase = new URL('.', import.meta.url).pathname.replace(/\/$/, '');
 let catalog: GuestCatalog | undefined;
 let active = true;
 let live: EventSource | undefined;
@@ -68,7 +70,7 @@ async function api<T>(
   method = 'GET',
   body?: unknown,
 ): Promise<T> {
-  const response = await fetch(`/guest${route}`, {
+  const response = await fetch(`${guestBase}${route}`, {
     method,
     headers: body === undefined ? {} : { 'content-type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -104,7 +106,7 @@ const size = (value: number) =>
 function downloadLink(id: string, file: SharedFile): HTMLAnchorElement {
   const download = element('a', 'Download');
   download.className = 'download';
-  download.href = `/guest/shares/${encodeURIComponent(id)}/files/${encodeURIComponent(file.id)}/content`;
+  download.href = `${guestBase}/shares/${encodeURIComponent(id)}/files/${encodeURIComponent(file.id)}/content`;
   download.download = file.name.split(/[/\\]/).at(-1) ?? 'download';
   download.setAttribute('aria-label', `Download ${file.name}`);
   download.target = '_blank';
@@ -130,17 +132,21 @@ function renderFiles(): void {
   collections.replaceChildren();
   for (const entry of catalog.shares) {
     if (entry.kind === 'file' && entry.file) {
-      const item = downloadLink(entry.id, entry.file);
+      const item = entry.file.preview
+        ? element('div')
+        : downloadLink(entry.id, entry.file);
       item.classList.add('collection');
       item.replaceChildren(
         element('strong', entry.name),
         element('small', size(entry.file.size)),
-        element('span', 'Download'),
+        entry.file.preview
+          ? downloadLink(entry.id, entry.file)
+          : element('span', 'Download'),
       );
       addPreview(
         item,
         entry.file,
-        `/guest/shares/${entry.id}/files/${entry.file.id}/preview`,
+        `${guestBase}/shares/${entry.id}/files/${entry.file.id}`,
       );
       collections.append(item);
       continue;
@@ -183,7 +189,7 @@ function renderFiles(): void {
     row.className = 'file-row';
     const name = element('span', file.name);
     name.className = 'file-name';
-    addPreview(name, file, `/guest/shares/${shareId}/files/${file.id}/preview`);
+    addPreview(name, file, `${guestBase}/shares/${shareId}/files/${file.id}`);
     const meta = element('span', size(file.size));
     meta.className = 'file-size';
     row.append(name, meta, downloadLink(shareId, file));
@@ -309,7 +315,7 @@ async function refresh(): Promise<void> {
 }
 
 function startLive(): void {
-  live = new EventSource('/guest/events');
+  live = new EventSource(`${guestBase}/events`);
   live.onopen = () => write('live', 'Live');
   live.onmessage = () => void action(refresh);
   live.onerror = () => {
@@ -339,6 +345,8 @@ el('back').addEventListener('click', () => {
 });
 el('file-filter').addEventListener('input', renderFiles);
 el('more').addEventListener('click', () => void action(() => loadFiles(false)));
+el('copy').hidden = !navigator.clipboard;
+if (!navigator.clipboard) write('select', 'Select text to copy');
 el('copy').addEventListener(
   'click',
   () =>
@@ -363,13 +371,36 @@ el('select').addEventListener(
       write('feedback', 'Text selected. Use your usual Copy shortcut.');
     }),
 );
+el('pin-form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  const button = el<HTMLButtonElement>('join-pin');
+  if (button.disabled) return;
+  const input = el<HTMLInputElement>('pin-code');
+  button.disabled = true;
+  void (async () => {
+    try {
+      await api('/pin', 'POST', { pin: input.value });
+      input.value = '';
+      location.reload();
+    } catch (error) {
+      endAccess(message(error));
+      write('live', 'Not joined');
+      input.value = '';
+      input.focus();
+    } finally {
+      button.disabled = false;
+    }
+  })();
+});
 el('leave').addEventListener(
   'click',
   () =>
     void action(async () => {
       await api('/logout', 'POST');
       endAccess(
-        'You have left this guest page. Reopen the original link to return while it is still valid.',
+        pinJoin
+          ? 'You have left this guest page. Ask the host for a new PIN to join again.'
+          : 'You have left this guest page. Reopen the original link to return while it is still valid.',
       );
     }),
 );
@@ -385,6 +416,18 @@ void (async () => {
   history.replaceState(null, '', location.pathname);
   try {
     if (token) await api('/session', 'POST', { token });
+    else {
+      const session = await api<{ authenticated: boolean }>('/session');
+      if (!session.authenticated) {
+        endAccess(
+          pinJoin
+            ? 'Enter the 4-digit PIN shown by the host.'
+            : 'Open the complete private link from the host to join.',
+        );
+        write('live', 'Not joined');
+        return;
+      }
+    }
     await refresh();
     if (active) startLive();
   } catch (error) {

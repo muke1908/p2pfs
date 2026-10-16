@@ -2,7 +2,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtemp, realpath, writeFile, readFile, rm } from 'node:fs/promises';
+import {
+  mkdtemp,
+  realpath,
+  writeFile,
+  readFile,
+  rm,
+  mkdir,
+} from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -64,6 +71,11 @@ test(
           const directory = path.join(
             root,
             mode === 'restart' ? 'publisher-crash' : mode,
+          );
+          await mkdir(directory, { recursive: true });
+          await writeFile(
+            path.join(directory, 'host.json'),
+            '{"access":"tunnel"}',
           );
           const managementPort = await availablePort();
           let transferPort = await availablePort();

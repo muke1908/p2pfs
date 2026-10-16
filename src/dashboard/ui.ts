@@ -19,6 +19,7 @@ interface DashboardState {
   whitepad: SharedWhitepad;
   guestLinks: GuestLinkSummary[];
   guestOrigin?: string;
+  access: 'lan' | 'tunnel';
   tunnel: { status: string; url?: string; external: boolean };
   warnings: string[];
 }
@@ -56,7 +57,17 @@ let padPaused = false;
 let padTimer: ReturnType<typeof setTimeout> | undefined;
 let padGeneration = 0;
 let generatedGuestId = '';
+let revealId = '';
+let revealTimer: ReturnType<typeof setTimeout> | undefined;
 let copying: AbortController | undefined;
+
+function clearGuestInvitation(): void {
+  generatedGuestId = '';
+  element<HTMLInputElement>('generated-url').value = '';
+  element<HTMLInputElement>('generated-pin').value = '';
+  element('guest-pin').hidden = true;
+  text('pin-expiry', '');
+}
 
 function node<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -131,8 +142,7 @@ function lock(): void {
   shareSignature = '';
   element<HTMLTextAreaElement>('whitepad').value = '';
   element<HTMLFormElement>('guest-form').reset();
-  element<HTMLInputElement>('generated-url').value = '';
-  generatedGuestId = '';
+  clearGuestInvitation();
   element('guest-list').replaceChildren();
   delete element('guest-list').dataset.signature;
   element('pad-recovery').hidden = true;
@@ -246,7 +256,11 @@ async function refresh(): Promise<void> {
     text('warnings', next.warnings.join(' '));
     text(
       'connection-label',
-      next.tunnel.url ? 'Tunnel is live' : 'Connection settings',
+      next.access === 'lan'
+        ? 'Local network sharing'
+        : next.tunnel.url
+          ? 'Tunnel is live'
+          : 'Connection settings',
     );
     if (previousShares !== shareSignature && view === 'shares') renderCatalog();
     renderConnection();
@@ -325,7 +339,7 @@ function renderCatalog(): void {
         addPreview(
           row.querySelector('.file-badge')!,
           indexed.file,
-          `/api/shares/${share.id}/files/${indexed.file.id}/preview`,
+          `/api/shares/${share.id}/files/${indexed.file.id}`,
         );
       if (indexed)
         actions.append(
@@ -513,7 +527,18 @@ function renderConnection(): void {
   text('connection-name', state.name);
   text('connection-id', state.id);
   element('external-tunnel-note').hidden = !state.tunnel.external;
-  element('managed-tunnel-controls').hidden = state.tunnel.external;
+  element('managed-tunnel-controls').hidden =
+    state.access === 'lan' || state.tunnel.external;
+  text(
+    'endpoint-label',
+    state.access === 'lan' ? 'LOCAL NETWORK ENDPOINT' : 'PUBLIC ENDPOINT',
+  );
+  text(
+    'connection-note',
+    state.access === 'lan'
+      ? 'Only devices that can reach this local network address can connect. HTTP traffic is not encrypted; use a trusted network. No router port forwarding is needed. To stop access, quit the publisher. Edit host.json and restart to choose a fixed LAN address or tunnel mode.'
+      : "Connection settings are managed in the host's configuration file. Traffic passes through an HTTPS relay; this is not end-to-end encryption.",
+  );
   text('tunnel-status', state.tunnel.status);
   const url = element<HTMLAnchorElement>('tunnel-url');
   url.hidden = !state.tunnel.url;
@@ -642,6 +667,13 @@ function onClick(
 
 function renderGuestLinks(): void {
   if (!state) return;
+  if (
+    revealId &&
+    !state.guestLinks.some(
+      (link) => link.id === revealId && (link.pinExpires ?? 0) > Date.now(),
+    )
+  )
+    dialog('pin-dialog').close();
   const container = element('guest-list');
   const signature = JSON.stringify(
     state.guestLinks.map((link) => [link, link.expires > Date.now()]),
@@ -660,15 +692,32 @@ function renderGuestLinks(): void {
         `${link.scope === 'session' ? 'Entire session · Files and live whitepad' : `Selected items (older link) · ${link.shareIds.length} shares · No whitepad access`} · ${link.expires > Date.now() ? 'Expires' : 'Expired'} ${new Date(link.expires).toLocaleString()}`,
       ),
     );
+    row.append(description);
+    if ((link.pinExpires ?? 0) > Date.now())
+      row.append(
+        button(
+          'Show PIN',
+          async () => {
+            revealId = link.id;
+            element<HTMLFormElement>('pin-reveal-form').reset();
+            element('pin-reveal-form').hidden = false;
+            text('pin-reveal-value', '');
+            text('pin-reveal-error', '');
+            dialog('pin-dialog').showModal();
+            element<HTMLInputElement>('pin-password').focus();
+          },
+          'secondary',
+          undefined,
+          'guest-link-error',
+        ),
+      );
     row.append(
-      description,
       button(
         'Revoke link',
         async () => {
           await api(`/guest-links/${encodeURIComponent(link.id)}`, 'DELETE');
           if (generatedGuestId === link.id) {
-            generatedGuestId = '';
-            element<HTMLInputElement>('generated-url').value = '';
+            clearGuestInvitation();
             element('guest-created').hidden = true;
             element('guest-form').hidden = false;
           }
@@ -695,15 +744,68 @@ function renderGuestLinks(): void {
     );
 }
 
+dialog('pin-dialog').addEventListener('close', () => {
+  revealId = '';
+  clearTimeout(revealTimer);
+  element<HTMLFormElement>('pin-reveal-form').reset();
+  text('pin-reveal-value', '');
+  text('pin-reveal-error', '');
+});
+element('pin-reveal-form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  void action(
+    async () => {
+      const id = revealId;
+      const input = element<HTMLInputElement>('pin-password');
+      const password = input.value;
+      input.value = '';
+      const result = await api<{ pin: string; expires: number }>(
+        `/guest-links/${encodeURIComponent(id)}/pin`,
+        'POST',
+        { password },
+      );
+      if (!unlocked || revealId !== id || result.expires <= Date.now()) return;
+      element('pin-reveal-form').hidden = true;
+      text(
+        'pin-reveal-value',
+        `PIN: ${result.pin} · Use once before ${new Date(result.expires).toLocaleTimeString()}.`,
+      );
+      revealTimer = setTimeout(
+        () => dialog('pin-dialog').close(),
+        result.expires - Date.now(),
+      );
+    },
+    element<HTMLButtonElement>('reveal-pin'),
+    'pin-reveal-error',
+  );
+});
+
 onClick('guest-links', async () => {
   await refresh();
   text('guest-link-error', '');
   text('guest-link-feedback', '');
+  const lan = state?.access === 'lan';
+  text(
+    'guest-description',
+    lan
+      ? 'Join this host from another device on your local network with a 4-digit PIN. Recipients only need a browser.'
+      : 'One private link for everything you share in this publisher session. Recipients only need a browser.',
+  );
+  text(
+    'guest-scope-note',
+    lan
+      ? 'Includes all current and future shared files, folders, and text. Folder shares include hidden and nested files. Access lasts up to 24 hours. Only the latest unused PIN works; creating another does not disconnect guests who already joined.'
+      : 'Includes all files, folders, and text you share from this publisher now or later. You can create the link before adding anything. Folder shares include hidden and nested files. Expires in 24 hours; anyone with the link can forward it.',
+  );
+  text('create-guest', lan ? 'Create PIN' : 'Create session link');
+  text('copy-guest', lan ? 'Copy join details' : 'Copy session link');
   text(
     'guest-tunnel-note',
-    state?.guestOrigin
-      ? ''
-      : 'Start a public tunnel in connection settings before creating a browser guest link.',
+    state?.access === 'lan'
+      ? 'Recipients must be on the same reachable local network. This link uses unencrypted HTTP.'
+      : state?.guestOrigin
+        ? ''
+        : 'Start a public tunnel in connection settings before creating a browser guest link.',
   );
   element<HTMLButtonElement>('create-guest').disabled = !state?.guestOrigin;
   element('guest-form').hidden = false;
@@ -712,29 +814,55 @@ onClick('guest-links', async () => {
   dialog('guest-dialog').showModal();
 });
 dialog('guest-dialog').addEventListener('close', () => {
-  generatedGuestId = '';
-  element<HTMLInputElement>('generated-url').value = '';
+  clearGuestInvitation();
   element<HTMLFormElement>('guest-form').reset();
 });
 element('guest-form').addEventListener('submit', (event) => {
   event.preventDefault();
   void action(
     async () => {
-      const result = await api<{ id: string; url: string }>(
-        '/guest-links',
-        'POST',
-        {
-          label: element<HTMLInputElement>('guest-label').value,
-        },
-      );
-      element<HTMLInputElement>('generated-url').value = result.url;
+      const result = await api<{
+        id: string;
+        url: string;
+        joinUrl?: string;
+        pin?: string;
+        pinExpires?: number;
+      }>('/guest-links', 'POST', {
+        label: element<HTMLInputElement>('guest-label').value,
+      });
+      clearGuestInvitation();
+      if (state?.access === 'lan') {
+        if (!result.joinUrl || !result.pin || !result.pinExpires)
+          throw new Error('The host did not return a LAN join PIN.');
+        element<HTMLInputElement>('generated-url').value = result.joinUrl;
+        element<HTMLInputElement>('generated-pin').value = result.pin;
+        element('guest-pin').hidden = false;
+        text(
+          'pin-expiry',
+          `Use once before ${new Date(result.pinExpires).toLocaleTimeString()}. Access continues after the PIN expires.`,
+        );
+        text('guest-created-title', 'Your join PIN is ready.');
+        text(
+          'guest-created-note',
+          'Open the address below on the receiving device and enter this PIN. It expires in 5 minutes and works once. Keep it private; anyone with it can join.',
+        );
+      } else {
+        element<HTMLInputElement>('generated-url').value = result.url;
+        text('guest-created-title', 'Your session link is ready.');
+        text(
+          'guest-created-note',
+          'Copy it now. The secret URL is shown only once; it is not stored on disk. Keep the publisher and its network connection running; new files and text will appear automatically.',
+        );
+      }
       generatedGuestId = result.id;
       element('guest-created').hidden = false;
       element('guest-form').hidden = true;
       await refresh();
       text(
         'guest-link-feedback',
-        'Session link created. Current and future files and text appear automatically. Share it privately.',
+        state?.access === 'lan'
+          ? 'PIN created. The address stays the same; share the PIN privately.'
+          : 'Session link created. Current and future files and text appear automatically. Share it privately.',
       );
     },
     element<HTMLButtonElement>('create-guest'),
@@ -745,20 +873,27 @@ onClick(
   'copy-guest',
   async () => {
     const input = element<HTMLInputElement>('generated-url');
+    const pin = element<HTMLInputElement>('generated-pin').value;
     if (!navigator.clipboard) {
       input.select();
       throw new Error(
-        'Clipboard unavailable. The link is selected; copy it manually.',
+        pin
+          ? 'Clipboard unavailable. Copy the address and PIN manually.'
+          : 'Clipboard unavailable. The link is selected; copy it manually.',
       );
     }
-    await navigator.clipboard.writeText(input.value);
-    text('guest-link-feedback', 'Guest link copied.');
+    await navigator.clipboard.writeText(
+      pin ? `${input.value}\nPIN: ${pin}` : input.value,
+    );
+    text(
+      'guest-link-feedback',
+      pin ? 'Join details copied.' : 'Guest link copied.',
+    );
   },
   'guest-link-error',
 );
 onClick('another-guest', async () => {
-  generatedGuestId = '';
-  element<HTMLInputElement>('generated-url').value = '';
+  clearGuestInvitation();
   element('guest-created').hidden = true;
   element('guest-form').hidden = false;
   element<HTMLFormElement>('guest-form').reset();
@@ -1002,7 +1137,7 @@ onClick(
     await refresh();
     text(
       'notice',
-      'Share added. Session-link recipients have read-only access while your tunnel is live.',
+      'Share added. Session-link recipients have read-only access while your connection is live.',
     );
   },
   'picker-error',

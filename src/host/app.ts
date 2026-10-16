@@ -1,8 +1,13 @@
-import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
+import Fastify, {
+  type FastifyInstance,
+  type FastifyReply,
+  type FastifyRequest,
+} from 'fastify';
 import { readFile } from 'node:fs/promises';
 import { timingSafeEqual } from 'node:crypto';
 import type { Readable } from 'node:stream';
-import { StateStore } from '../config/state.js';
+import { StateStore, type Access } from '../config/state.js';
+import { lanAddress, parseGuestUrl } from '../config/network.js';
 import { AppError, Sessions, digest } from '../security/auth.js';
 import { Transport, tunnelHosts, publicUrl } from '../security/transport.js';
 import { Shares } from '../shares/service.js';
@@ -54,6 +59,9 @@ export interface HostOptions {
   managementPort?: number;
   transport?: Transport;
   publicUrl?: string;
+  lanAddress?: string;
+  access?: Access;
+  guestUrl?: string;
 }
 export class Host {
   readonly transfer: FastifyInstance;
@@ -77,11 +85,34 @@ export class Host {
   private liveTimer?: NodeJS.Timeout;
   private lastLiveState = '';
   private lastLiveCatalog = '';
+  private lanAddress?: string;
+  private guestUrl?: URL;
 
   constructor(
     readonly store: StateStore,
     private options: HostOptions = {},
   ) {
+    if (
+      options.lanAddress !== undefined &&
+      (options.publicUrl || options.access === 'tunnel')
+    )
+      throw new AppError(
+        400,
+        'An explicit LAN address cannot be combined with tunnel mode or a public URL.',
+      );
+    const access =
+      options.lanAddress !== undefined
+        ? 'lan'
+        : options.publicUrl
+          ? 'tunnel'
+          : (options.access ?? store.access);
+    if (access === 'lan')
+      this.lanAddress = lanAddress(options.lanAddress ?? store.lanAddress);
+    const guestUrl = options.guestUrl ?? store.guestUrl;
+    if (guestUrl) {
+      const parsed = new URL(parseGuestUrl(guestUrl));
+      if (this.lanAddress) this.guestUrl = parsed;
+    }
     this.transport =
       options.transport ??
       new Transport({
@@ -103,6 +134,7 @@ export class Host {
             'req.headers.cookie',
             'password',
             'token',
+            'pin',
           ],
         },
       });
@@ -147,7 +179,7 @@ export class Host {
       await this.uploads.initialize();
       await this.shares.initialize();
       this.transferUrl = await this.transfer.listen({
-        host: '127.0.0.1',
+        host: this.lanAddress ?? '127.0.0.1',
         port: this.options.transferPort ?? 7331,
       });
       this.managementUrl = await this.management.listen({
@@ -164,6 +196,8 @@ export class Host {
   }
 
   async startTunnel(): Promise<void> {
+    if (this.lanAddress)
+      throw new AppError(409, 'LAN sharing does not use a public tunnel.');
     if (this.options.publicUrl)
       throw new AppError(409, 'This host uses an externally managed tunnel.');
     if (this.closing) throw new AppError(409, 'Host is stopping.');
@@ -211,11 +245,16 @@ export class Host {
       whitepad: this.whitepad.get(),
       guestLinks: this.guestLinks.list(),
       guestOrigin: this.guestOrigin(),
+      access: this.lanAddress ? 'lan' : 'tunnel',
       tunnel: {
-        status: this.options.publicUrl
-          ? 'Externally managed'
-          : this.tunnel.status,
-        url: this.options.publicUrl ?? this.tunnel.url,
+        status: this.lanAddress
+          ? 'LAN sharing'
+          : this.options.publicUrl
+            ? 'Externally managed'
+            : this.tunnel.status,
+        url: this.lanAddress
+          ? this.transferUrl
+          : (this.options.publicUrl ?? this.tunnel.url),
         external: Boolean(this.options.publicUrl),
         version: this.tunnel.version,
       },
@@ -224,6 +263,19 @@ export class Host {
   }
 
   private publicRoutes(): void {
+    const prefix = this.guestUrl?.pathname.replace(/\/$/, '');
+    this.transfer.addHook('onRequest', async (request) => {
+      if (
+        this.lanAddress &&
+        request.headers.host !== new URL(this.transferUrl).host &&
+        !(
+          this.guestUrl &&
+          request.headers.host === this.guestUrl.host &&
+          request.url.split('?')[0]!.startsWith(`${prefix}/`)
+        )
+      )
+        throw new AppError(403, 'LAN request Host rejected.');
+    });
     this.transfer.get('/v1/health', async () => ({
       protocol: 1,
       id: this.store.state.id,
@@ -231,7 +283,12 @@ export class Host {
     this.transfer.get('/favicon.ico', async (_request, reply) =>
       reply.code(204).send(),
     );
-    this.guestRoutes();
+    this.transfer.register(async (server) => this.guestRoutes(server));
+    if (prefix)
+      this.transfer.register(
+        async (server) => this.guestRoutes(server, prefix),
+        { prefix },
+      );
   }
 
   private localRoutes(): void {
@@ -337,18 +394,45 @@ export class Host {
         },
       },
       async (request) => {
-        const origin = this.guestOrigin();
+        const origin =
+          this.guestUrl?.href.replace(/\/$/, '') ?? this.guestOrigin();
         if (!origin)
           throw new AppError(
             409,
             'Start a public tunnel before creating a guest link.',
           );
-        const link = await this.guestLinks.create(request.body.label);
+        const link = await this.guestLinks.create(
+          request.body.label,
+          Boolean(this.lanAddress),
+        );
         return {
           id: link.id,
           expires: link.expires,
           url: `${origin}/receive#token=${link.token}`,
+          joinUrl: this.lanAddress ? `${origin}/receive` : undefined,
+          pin: link.pin,
+          pinExpires: link.pinExpires,
         };
+      },
+    );
+    this.management.post<{
+      Params: { id: string };
+      Body: { password: string };
+    }>(
+      '/api/guest-links/:id/pin',
+      {
+        schema: {
+          params: bodySchema({ id: identifier }, ['id']),
+          body: passwordBody,
+        },
+      },
+      async (request) => {
+        if (!this.lanAddress)
+          throw new AppError(404, 'PIN joining is available only in LAN mode.');
+        if (!(await this.localSessions.verify(request.body.password)))
+          throw new AppError(403, 'Invalid host password.');
+        this.localSessions.require(this.cookie(request));
+        return this.guestLinks.revealPin(request.params.id);
       },
     );
     this.management.delete<{ Params: { id: string } }>(
@@ -439,25 +523,29 @@ export class Host {
         };
       },
     );
-    this.management.get<{ Params: { shareId: string; fileId: string } }>(
-      '/api/shares/:shareId/files/:fileId/preview',
-      {
-        schema: {
-          params: bodySchema({ shareId: identifier, fileId: identifier }, [
-            'shareId',
-            'fileId',
-          ]),
+    for (const format of ['preview', 'image'] as const)
+      this.management.get<{ Params: { shareId: string; fileId: string } }>(
+        `/api/shares/:shareId/files/:fileId/${format}`,
+        {
+          schema: {
+            params: bodySchema({ shareId: identifier, fileId: identifier }, [
+              'shareId',
+              'fileId',
+            ]),
+          },
         },
-      },
-      async (request, reply) => {
-        const preview = await this.previews.create(
-          request.params.shareId,
-          request.params.fileId,
-        );
-        this.localSessions.require(this.cookie(request));
-        return reply.type('image/webp').send(preview);
-      },
-    );
+        async (request, reply) => {
+          const preview = await this.previews.create(
+            request.params.shareId,
+            request.params.fileId,
+            format === 'image',
+          );
+          this.localSessions.require(this.cookie(request));
+          return reply
+            .type(format === 'image' ? 'image/png' : 'image/webp')
+            .send(preview);
+        },
+      );
     this.management.post<{ Params: { id: string } }>(
       '/api/shares/:id/refresh',
       {
@@ -492,6 +580,8 @@ export class Host {
       },
     );
     this.management.post('/api/tunnel/stop', async () => {
+      if (this.lanAddress)
+        throw new AppError(409, 'LAN sharing does not use a public tunnel.');
       if (this.options.publicUrl)
         throw new AppError(409, 'Stop the external tunnel using its provider.');
       await this.tunnel.stop();
@@ -500,6 +590,8 @@ export class Host {
   }
 
   private guestOrigin(): string | undefined {
+    if (this.guestUrl) return this.guestUrl.origin;
+    if (this.lanAddress) return this.transferUrl || undefined;
     if (this.tunnel.url) return this.tunnel.url;
     if (this.options.publicUrl)
       return publicUrl(this.options.publicUrl, this.transport.options).origin;
@@ -516,17 +608,35 @@ export class Host {
         );
   }
 
-  private guestRoutes(): void {
+  private guestRoutes(server: FastifyInstance, prefix = ''): void {
+    const external =
+      this.guestUrl?.pathname.replace(/\/$/, '') === prefix
+        ? this.guestUrl
+        : undefined;
     const cookieName = `p2pfs_guest_${this.store.state.id}`;
     const session = (request: FastifyRequest) =>
       this.readCookie(request, cookieName);
     const authorized = (request: FastifyRequest) =>
       this.guestLinks.require(session(request));
     const cookie = (value: string, age: number) =>
-      `${cookieName}=${value}; HttpOnly; SameSite=Strict; Path=/guest; Max-Age=${age}${this.guestOrigin()?.startsWith('https:') ? '; Secure' : ''}`;
-    this.transfer.addHook('onRequest', async (request, reply) => {
-      const pathname = request.url.split('?')[0];
+      `${cookieName}=${value}; HttpOnly; SameSite=Strict; Path=${prefix}/guest; Max-Age=${age}${external?.protocol === 'https:' || (!this.lanAddress && this.guestOrigin()?.startsWith('https:')) ? '; Secure' : ''}`;
+    const accept = (
+      reply: FastifyReply,
+      access: { session: string; expires: number },
+    ) => {
+      reply.header(
+        'set-cookie',
+        cookie(
+          access.session,
+          Math.max(0, Math.floor((access.expires - Date.now()) / 1000)),
+        ),
+      );
+      return { ok: true };
+    };
+    server.addHook('onRequest', async (request, reply) => {
+      const pathname = request.url.split('?')[0]!.slice(prefix.length);
       if (
+        pathname !== '/' &&
         pathname !== '/receive' &&
         pathname !== '/receive.js' &&
         !pathname?.startsWith('/guest/')
@@ -542,21 +652,30 @@ export class Host {
         pathname.startsWith('/guest/') &&
         (request.headers['sec-fetch-site'] === 'cross-site' ||
           (request.headers.origin &&
-            ![this.guestOrigin(), this.transferUrl].includes(
-              request.headers.origin,
-            )))
+            ![
+              external?.origin ??
+                (this.lanAddress ? undefined : this.guestOrigin()),
+              this.transferUrl,
+            ].includes(request.headers.origin)))
       )
         throw new AppError(403, 'Guest request Origin rejected.');
     });
-    this.transfer.get('/receive', async (_request, reply) =>
-      reply.type('text/html').send(guestPage),
+    if (prefix)
+      server.get('/', async (_request, reply) =>
+        reply.type('text/html').send(guestPage(Boolean(this.lanAddress))),
+      );
+    server.get('/receive', async (_request, reply) =>
+      reply.type('text/html').send(guestPage(Boolean(this.lanAddress))),
     );
-    this.transfer.get('/receive.js', async (_request, reply) =>
+    server.get('/receive.js', async (_request, reply) =>
+      reply.redirect(`${prefix}/guest/ui.js`),
+    );
+    server.get('/guest/ui.js', async (_request, reply) =>
       reply
         .type('text/javascript')
         .send(await readFile(new URL('guest/ui.js', browserAssets), 'utf8')),
     );
-    this.transfer.get('/shares/preview-ui.js', async (_request, reply) =>
+    server.get('/shares/preview-ui.js', async (_request, reply) =>
       reply
         .type('text/javascript')
         .send(
@@ -566,7 +685,7 @@ export class Host {
           ),
         ),
     );
-    this.transfer.post<{ Body: { token: string } }>(
+    server.post<{ Body: { token: string } }>(
       '/guest/session',
       {
         schema: {
@@ -576,19 +695,27 @@ export class Host {
           ),
         },
       },
-      async (request, reply) => {
-        const access = this.guestLinks.exchange(request.body.token);
-        reply.header(
-          'set-cookie',
-          cookie(
-            access.session,
-            Math.max(0, Math.floor((access.expires - Date.now()) / 1000)),
-          ),
-        );
-        return { ok: true };
-      },
+      async (request, reply) =>
+        accept(reply, this.guestLinks.exchange(request.body.token)),
     );
-    this.transfer.post('/guest/logout', async (request, reply) => {
+    server.get('/guest/session', async (request) => ({
+      authenticated: Boolean(this.guestLinks.valid(session(request))),
+    }));
+    if (this.lanAddress)
+      server.post<{ Body: { pin: string } }>(
+        '/guest/pin',
+        {
+          schema: {
+            body: bodySchema(
+              { pin: { type: 'string', pattern: '^[0-9]{4}$' } },
+              ['pin'],
+            ),
+          },
+        },
+        async (request, reply) =>
+          accept(reply, this.guestLinks.exchangePin(request.body.pin)),
+      );
+    server.post('/guest/logout', async (request, reply) => {
       authorized(request);
       this.guestLinks.logout(session(request));
       reply.header('set-cookie', cookie('', 0));
@@ -596,7 +723,7 @@ export class Host {
       this.stopInvalidGuestStreams();
       return { ok: true };
     });
-    this.transfer.get('/guest/catalog', async (request) => {
+    server.get('/guest/catalog', async (request) => {
       const link = authorized(request);
       return {
         name: this.store.state.name,
@@ -612,7 +739,7 @@ export class Host {
         whitepad: link.scope === 'session' ? this.whitepad.get() : null,
       };
     });
-    this.transfer.get('/guest/events', async (request, reply) => {
+    server.get('/guest/events', async (request, reply) => {
       authorized(request);
       const value = session(request);
       this.guestLive.connect(reply, () =>
@@ -620,7 +747,7 @@ export class Host {
       );
       return reply;
     });
-    this.transfer.get('/guest/whitepad', async (request) => {
+    server.get('/guest/whitepad', async (request) => {
       const link = authorized(request);
       if (link.scope !== 'session')
         throw new AppError(
@@ -629,7 +756,7 @@ export class Host {
         );
       return this.whitepad.get();
     });
-    this.transfer.get<{
+    server.get<{
       Params: { shareId: string };
       Querystring: { offset?: number };
     }>(
@@ -653,32 +780,36 @@ export class Host {
         return this.shares.files(request.params.shareId, request.query.offset);
       },
     );
-    this.transfer.get<{ Params: { shareId: string; fileId: string } }>(
-      '/guest/shares/:shareId/files/:fileId/preview',
-      {
-        schema: {
-          params: bodySchema({ shareId: identifier, fileId: identifier }, [
-            'shareId',
-            'fileId',
-          ]),
+    for (const format of ['preview', 'image'] as const)
+      server.get<{ Params: { shareId: string; fileId: string } }>(
+        `/guest/shares/:shareId/files/:fileId/${format}`,
+        {
+          schema: {
+            params: bodySchema({ shareId: identifier, fileId: identifier }, [
+              'shareId',
+              'fileId',
+            ]),
+          },
         },
-      },
-      async (request, reply) => {
-        const link = authorized(request);
-        if (
-          link.scope !== 'session' &&
-          !link.shareIds.includes(request.params.shareId)
-        )
-          throw new AppError(404, 'Share not available through this link.');
-        const preview = await this.previews.create(
-          request.params.shareId,
-          request.params.fileId,
-        );
-        authorized(request);
-        return reply.type('image/webp').send(preview);
-      },
-    );
-    this.transfer.get<{ Params: { shareId: string; fileId: string } }>(
+        async (request, reply) => {
+          const link = authorized(request);
+          if (
+            link.scope !== 'session' &&
+            !link.shareIds.includes(request.params.shareId)
+          )
+            throw new AppError(404, 'Share not available through this link.');
+          const preview = await this.previews.create(
+            request.params.shareId,
+            request.params.fileId,
+            format === 'image',
+          );
+          authorized(request);
+          return reply
+            .type(format === 'image' ? 'image/png' : 'image/webp')
+            .send(preview);
+        },
+      );
+    server.get<{ Params: { shareId: string; fileId: string } }>(
       '/guest/shares/:shareId/files/:fileId/content',
       {
         schema: {

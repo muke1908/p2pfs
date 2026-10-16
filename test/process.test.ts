@@ -12,6 +12,8 @@ import {
 } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import http from 'node:http';
+import { isPrivateIPv4, lanAddress } from '../src/config/network.js';
 import { availablePort } from '../src/tunnels/manager.js';
 
 const password = 'test-password-not-a-secret';
@@ -179,7 +181,7 @@ test('a separate host process serves browser links, persists them across restart
   }
 });
 
-test('publisher CLI always starts the configured tunnel and rejects removed options', async () => {
+test('publisher CLI explicitly starts the configured tunnel and rejects removed options', async () => {
   for (const command of [
     'share',
     'receive',
@@ -213,7 +215,10 @@ test('publisher CLI always starts the configured tunnel and rejects removed opti
     ]),
     /unknown option/,
   );
-  await writeFile(path.join(root, 'host.json'), '{"provider":"devtunnel"}\n');
+  await writeFile(
+    path.join(root, 'host.json'),
+    '{"provider":"devtunnel","lanAddress":"192.168.250.250"}\n',
+  );
   const managementPort = await availablePort();
   let transferPort = await availablePort();
   while (transferPort === managementPort) transferPort = await availablePort();
@@ -230,8 +235,12 @@ test('publisher CLI always starts the configured tunnel and rejects removed opti
       '--transfer-port',
       String(transferPort),
       '--password-stdin',
+      '--tunnel',
     ],
-    { stdio: ['pipe', 'pipe', 'pipe'] },
+    {
+      env: { ...process.env, P2PFS_TEST_NO_LAN: '1' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    },
   );
   let output = '';
   let errors = '';
@@ -294,6 +303,321 @@ test('publisher CLI always starts the configured tunnel and rejects removed opti
   }
 });
 
+const lan = Object.values(os.networkInterfaces())
+  .flat()
+  .some(
+    (entry) =>
+      entry?.family === 'IPv4' &&
+      !entry.internal &&
+      isPrivateIPv4(entry.address),
+  )
+  ? lanAddress()
+  : undefined;
+
+test(
+  'LAN sharing starts by default and supports explicit addresses, saved configuration, and the Mac supervisor',
+  { skip: !lan && 'No private IPv4 network interface is available' },
+  async (t) => {
+    assert.ok(lan);
+    for (const conflict of [
+      ['--tunnel'],
+      ['--public-url', 'https://example.ngrok.app'],
+    ])
+      await assert.rejects(
+        promisify(execFile)(process.execPath, [
+          'dist/src/cli/main.js',
+          '--lan',
+          lan,
+          ...conflict,
+        ]),
+        /cannot be used with/,
+      );
+    for (const mode of ['default', 'flag', 'configuration', 'mac']) {
+      await t.test(mode, async () => {
+        const root = await realpath(
+          await mkdtemp(path.join(os.tmpdir(), 'p2pfs-lan-')),
+        );
+        if (mode === 'configuration')
+          await writeFile(
+            path.join(root, 'host.json'),
+            JSON.stringify({ lanAddress: lan }),
+          );
+        if (mode === 'default')
+          await writeFile(
+            path.join(root, 'host.json'),
+            '{"provider":"devtunnel"}',
+          );
+        if (mode === 'flag') {
+          await writeFile(
+            path.join(root, 'host.json'),
+            '{"access":"tunnel","provider":"zrok"}',
+          );
+        }
+        const managementPort = await availablePort();
+        let transferPort = await availablePort();
+        while (transferPort === managementPort)
+          transferPort = await availablePort();
+        const child = spawn(
+          process.execPath,
+          [
+            '--import',
+            './dist/test/cli-tunnel-fixture.js',
+            `dist/src/cli/${mode === 'mac' ? 'mac-host' : 'main'}.js`,
+            '--state-dir',
+            root,
+            '--management-port',
+            String(managementPort),
+            '--transfer-port',
+            String(transferPort),
+            ...(mode === 'flag' ? ['--lan', lan] : []),
+            ...(mode === 'mac' ? [] : ['--password-stdin']),
+          ],
+          {
+            env: { ...process.env, P2PFS_TEST_TUNNEL_FAILURE: '1' },
+            stdio: ['pipe', 'pipe', 'pipe'],
+          },
+        );
+        let output = '';
+        let errors = '';
+        const content = `http://${lan}:${transferPort}`;
+        const dashboard = `http://127.0.0.1:${managementPort}`;
+        let events: Awaited<ReturnType<typeof fetch>> | undefined;
+        try {
+          await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(
+              () => reject(new Error(`LAN startup timed out: ${errors}`)),
+              10_000,
+            );
+            const ready = () => {
+              if (
+                (mode === 'mac' ? errors : output).includes('LAN endpoint:') &&
+                errors.includes('unencrypted HTTP') &&
+                (mode !== 'mac' || output.includes('"status":"LAN sharing"'))
+              ) {
+                clearTimeout(timer);
+                resolve();
+              }
+            };
+            child.stdout.on('data', (chunk: Buffer) => {
+              output += chunk.toString();
+              ready();
+            });
+            child.stderr.on('data', (chunk: Buffer) => {
+              errors += chunk.toString();
+              ready();
+            });
+            child.once('error', (error) => {
+              clearTimeout(timer);
+              reject(error);
+            });
+            child.once('exit', (code) => {
+              clearTimeout(timer);
+              reject(new Error(`LAN publisher exited (${code}): ${errors}`));
+            });
+            if (mode === 'mac') child.stdin.write(`${password}\n`);
+            else child.stdin.end(`${password}\n`);
+          });
+          assert.equal(output.includes('Synthetic tunnel start'), false);
+          assert.equal(errors.includes('Synthetic tunnel start'), false);
+          assert.match(errors, /unencrypted HTTP/);
+          const local = await management(dashboard);
+          const state = await (await local('/api/state')).json();
+          assert.equal(state.access, 'lan');
+          assert.equal(state.guestOrigin, content);
+          assert.equal(state.tunnel.status, 'LAN sharing');
+          assert.equal(state.managementUrl, dashboard);
+          assert.equal((await fetch(`${content}/receive`)).status, 200);
+          assert.equal((await fetch(`${content}/receive.js`)).status, 200);
+          assert.equal((await fetch(`${content}/api/state`)).status, 404);
+          await assert.rejects(
+            fetch(`http://${lan}:${managementPort}/api/state`, {
+              signal: AbortSignal.timeout(2000),
+            }),
+          );
+          await assert.rejects(
+            fetch(`http://127.0.0.1:${transferPort}/receive`),
+          );
+          assert.equal(
+            await new Promise<number | undefined>((resolve, reject) => {
+              http
+                .get(
+                  `${content}/receive`,
+                  { headers: { host: 'untrusted.example' } },
+                  (response) => {
+                    response.resume();
+                    resolve(response.statusCode);
+                  },
+                )
+                .once('error', reject);
+            }),
+            403,
+          );
+          for (const operation of ['start', 'stop'])
+            assert.equal(
+              (await local(`/api/tunnel/${operation}`, 'POST', {})).status,
+              409,
+            );
+          const file = path.join(root, 'payload.txt');
+          await writeFile(file, 'direct LAN transfer');
+          const shared = await local('/api/shares', 'POST', { path: file });
+          assert.equal(shared.status, 200);
+          const { id: shareId } = await shared.json();
+          const pad = await local('/api/whitepad', 'PUT', {
+            content: 'LAN whitepad',
+            revision: 0,
+          });
+          assert.equal(pad.status, 200, await pad.text());
+          const created = await local('/api/guest-links', 'POST', {
+            label: 'LAN guest',
+          });
+          assert.equal(created.status, 200);
+          const link = await created.json();
+          assert.equal(new URL(link.url).origin, content);
+          assert.equal(link.joinUrl, `${content}/receive`);
+          assert.match(link.pin, /^[0-9]{4}$/);
+          assert.ok(link.pinExpires > Date.now());
+          const landing = await (await fetch(link.joinUrl)).text();
+          assert.match(landing, /id="pin-form">/);
+          assert.deepEqual(
+            await (await fetch(`${content}/guest/session`)).json(),
+            { authenticated: false },
+          );
+          const token = new URLSearchParams(
+            new URL(link.url).hash.slice(1),
+          ).get('token');
+          assert.equal((await fetch(`${content}/guest/catalog`)).status, 401);
+          const exchange = (origin: string) =>
+            fetch(`${content}/guest/session`, {
+              method: 'POST',
+              headers: { origin, 'content-type': 'application/json' },
+              body: JSON.stringify({ token }),
+            });
+          assert.equal(
+            (await exchange('http://untrusted.example')).status,
+            403,
+          );
+          const tokenSession = await exchange(content);
+          assert.equal(tokenSession.status, 200);
+          const exchangePin = (origin: string, pin = link.pin) =>
+            fetch(`${content}/guest/pin`, {
+              method: 'POST',
+              headers: { origin, 'content-type': 'application/json' },
+              body: JSON.stringify({ pin }),
+            });
+          assert.equal(
+            (await exchangePin('http://untrusted.example')).status,
+            403,
+          );
+          assert.equal((await exchangePin(content, '123')).status, 400);
+          const session = await exchangePin(content);
+          assert.equal(session.status, 200);
+          assert.equal((await exchangePin(content)).status, 401);
+          const setCookie = session.headers.get('set-cookie')!;
+          assert.match(setCookie, /HttpOnly; SameSite=Strict; Path=\/guest;/);
+          assert.match(setCookie.split(';')[0]!, /=[a-zA-Z0-9_-]{43}$/);
+          assert.equal(setCookie.includes('; Secure'), false);
+          const headers = { cookie: setCookie.split(';')[0]! };
+          assert.deepEqual(
+            await (await fetch(`${content}/guest/session`, { headers })).json(),
+            { authenticated: true },
+          );
+          assert.equal(
+            (await fetch(`${dashboard}/api/state`, { headers })).status,
+            401,
+          );
+          const catalog = await (
+            await fetch(`${content}/guest/catalog`, { headers })
+          ).json();
+          assert.equal(catalog.whitepad.content, 'LAN whitepad');
+          assert.equal(catalog.shares[0].id, shareId);
+          const listing = await (
+            await fetch(`${content}/guest/shares/${shareId}/files`, {
+              headers,
+            })
+          ).json();
+          const download = await fetch(
+            `${content}/guest/shares/${shareId}/files/${listing.files[0].id}/content`,
+            { headers },
+          );
+          assert.equal(download.status, 200);
+          assert.equal(await download.text(), 'direct LAN transfer');
+          events = await fetch(`${content}/guest/events`, {
+            headers,
+            signal: AbortSignal.timeout(5000),
+          });
+          assert.equal(events.status, 200);
+          assert.match(
+            events.headers.get('content-type')!,
+            /text\/event-stream/,
+          );
+          await events.body!.cancel();
+          events = undefined;
+          assert.equal(
+            (await local(`/api/guest-links/${link.id}`, 'DELETE')).status,
+            200,
+          );
+          assert.equal(
+            (await fetch(`${content}/guest/catalog`, { headers })).status,
+            401,
+          );
+          assert.deepEqual(
+            await (await fetch(`${content}/guest/session`, { headers })).json(),
+            { authenticated: false },
+          );
+          await stop(child);
+          await assert.rejects(readFile(path.join(root, 'process.lock')), {
+            code: 'ENOENT',
+          });
+          for (const origin of [content, dashboard])
+            await assert.rejects(fetch(`${origin}/v1/health`));
+        } finally {
+          try {
+            await events?.body?.cancel();
+            await stop(child);
+          } finally {
+            await rm(root, { recursive: true, force: true });
+          }
+        }
+      });
+    }
+  },
+);
+
+test('default LAN startup fails explicitly without a private interface and never starts a tunnel', async () => {
+  const root = await realpath(
+    await mkdtemp(path.join(os.tmpdir(), 'p2pfs-no-lan-')),
+  );
+  try {
+    const command = promisify(execFile)(
+      process.execPath,
+      [
+        '--import',
+        './dist/test/cli-tunnel-fixture.js',
+        'dist/src/cli/main.js',
+        '--state-dir',
+        root,
+        '--password-stdin',
+      ],
+      {
+        env: { ...process.env, P2PFS_TEST_NO_LAN: '1' },
+        timeout: 10_000,
+      },
+    );
+    let output = '';
+    command.child.stdout!.on('data', (chunk: Buffer) => {
+      output += chunk.toString();
+    });
+    command.child.stdin!.end(`${password}\n`);
+    await assert.rejects(command, /No private IPv4 network address.*--tunnel/);
+    assert.equal(output.includes('Synthetic tunnel start'), false);
+    await assert.rejects(readFile(path.join(root, 'process.lock')), {
+      code: 'ENOENT',
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('publisher exits on tunnel prerequisite failure and releases its listeners and lock', async () => {
   const root = await realpath(
     await mkdtemp(path.join(os.tmpdir(), 'p2pfs-cli-failure-')),
@@ -314,6 +638,7 @@ test('publisher exits on tunnel prerequisite failure and releases its listeners 
       '--transfer-port',
       String(transferPort),
       '--password-stdin',
+      '--tunnel',
     ],
     {
       env: { ...process.env, P2PFS_TEST_TUNNEL_FAILURE: '1' },
@@ -350,7 +675,7 @@ test('publisher exits on tunnel prerequisite failure and releases its listeners 
     });
     assert.deepEqual(
       JSON.parse(await readFile(path.join(root, 'host.json'), 'utf8')),
-      { provider: 'ngrok' },
+      { access: 'lan', provider: 'ngrok' },
     );
     for (const port of [managementPort, transferPort])
       await assert.rejects(fetch(`http://127.0.0.1:${port}/v1/health`));
