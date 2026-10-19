@@ -94,7 +94,9 @@ opens the short address shown, such as `http://192.168.8.100:7331/receive`,
 and enters the **4-digit PIN**. No long token needs to be copied. **Copy join
 details** copies the address and PIN together.
 
-The PIN works **once** and expires after **5 minutes**. To see it again, choose
+The PIN is shown immediately after creation; there is no extra reveal step.
+The PIN works **once** and expires after **5 minutes**. After closing the
+creation view, return to **Guest links** and choose
 **Show PIN** under **Issued links** and confirm your host password (at least
 12 characters). Only the latest unused, unexpired PIN can be revealed; showing
 it does not reset its expiry. Creating another PIN replaces any unused PIN on this host, without
@@ -162,6 +164,16 @@ is explicitly trusted for that prefix; arbitrary hosts and cross-site requests
 are still rejected. The normal LAN-IP receiver remains available with its
 original cookie path. PINs and private links are still required. Use only a
 trusted LAN, and do not expose the proxy to the internet.
+
+To disable direct LAN access and make the proxy the only network entrance,
+add `"proxyOnly": true` alongside `guestUrl` in `host.json`, or pass
+`--proxy-only`. This requires LAN mode and a guest URL; invalid combinations
+fail rather than falling back to a public listener. The guest server then
+binds to `127.0.0.1`, while keeping LAN PIN joining and its normal authentication.
+Point a reverse proxy **on the same computer** to `127.0.0.1:7331` (or your
+chosen transfer port), still preserving the configured Host and path prefix.
+The host dashboard remains loopback-only. Without this opt-in, standalone
+LAN sharing retains its existing direct-LAN behavior.
 
 ### Configure the tunnel host
 

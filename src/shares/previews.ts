@@ -59,7 +59,7 @@ export class Previews {
             fullSize
               ? image.png()
               : image
-                  .resize(128, 128, {
+                  .resize(256, 256, {
                     fit: 'inside',
                     withoutEnlargement: true,
                   })

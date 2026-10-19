@@ -19,6 +19,7 @@ interface StartOptions {
   lan?: string;
   tunnel?: boolean;
   guestUrl?: string;
+  proxyOnly?: boolean;
 }
 
 function port(input: string): number {
@@ -169,6 +170,7 @@ async function start(options: StartOptions): Promise<void> {
       lanAddress: options.lan,
       access: options.tunnel ? 'tunnel' : undefined,
       guestUrl: options.guestUrl,
+      proxyOnly: options.proxyOnly,
     });
     await host.listen();
     startup.signal.throwIfAborted();
@@ -195,7 +197,9 @@ async function start(options: StartOptions): Promise<void> {
       report();
     }
     if (host.state().access === 'lan') {
-      console.log(`LAN endpoint: ${host.transferUrl}`);
+      console.log(
+        `${host.state().proxyOnly ? 'Proxy backend (loopback only)' : 'LAN endpoint'}: ${host.transferUrl}`,
+      );
       console.error(
         'LAN sharing uses unencrypted HTTP. Only share on a trusted private network. No tunnel is started.',
       );
@@ -260,6 +264,12 @@ cli
     '--guest-url <url>',
     'LAN reverse proxy guest address, including an optional path prefix',
     parseGuestUrl,
+  )
+  .addOption(
+    new Option(
+      '--proxy-only',
+      'Bind the LAN guest server to loopback; requires a guest URL',
+    ).conflicts(['tunnel', 'publicUrl']),
   )
   .addOption(
     new Option(

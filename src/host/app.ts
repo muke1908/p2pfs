@@ -62,6 +62,7 @@ export interface HostOptions {
   lanAddress?: string;
   access?: Access;
   guestUrl?: string;
+  proxyOnly?: boolean;
 }
 export class Host {
   readonly transfer: FastifyInstance;
@@ -87,6 +88,7 @@ export class Host {
   private lastLiveCatalog = '';
   private lanAddress?: string;
   private guestUrl?: URL;
+  private proxyOnly: boolean;
 
   constructor(
     readonly store: StateStore,
@@ -113,6 +115,12 @@ export class Host {
       const parsed = new URL(parseGuestUrl(guestUrl));
       if (this.lanAddress) this.guestUrl = parsed;
     }
+    this.proxyOnly = options.proxyOnly ?? store.proxyOnly;
+    if (this.proxyOnly && !this.guestUrl)
+      throw new AppError(
+        400,
+        'Proxy-only sharing requires LAN mode and a configured guest URL.',
+      );
     this.transport =
       options.transport ??
       new Transport({
@@ -179,7 +187,7 @@ export class Host {
       await this.uploads.initialize();
       await this.shares.initialize();
       this.transferUrl = await this.transfer.listen({
-        host: this.lanAddress ?? '127.0.0.1',
+        host: this.proxyOnly ? '127.0.0.1' : (this.lanAddress ?? '127.0.0.1'),
         port: this.options.transferPort ?? 7331,
       });
       this.managementUrl = await this.management.listen({
@@ -246,6 +254,7 @@ export class Host {
       guestLinks: this.guestLinks.list(),
       guestOrigin: this.guestOrigin(),
       access: this.lanAddress ? 'lan' : 'tunnel',
+      proxyOnly: this.proxyOnly,
       tunnel: {
         status: this.lanAddress
           ? 'LAN sharing'

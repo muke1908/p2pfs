@@ -675,9 +675,10 @@ function renderGuestLinks(): void {
   )
     dialog('pin-dialog').close();
   const container = element('guest-list');
-  const signature = JSON.stringify(
+  const signature = JSON.stringify([
+    generatedGuestId,
     state.guestLinks.map((link) => [link, link.expires > Date.now()]),
-  );
+  ]);
   if (container.dataset.signature === signature) return;
   container.dataset.signature = signature;
   container.replaceChildren();
@@ -693,7 +694,7 @@ function renderGuestLinks(): void {
       ),
     );
     row.append(description);
-    if ((link.pinExpires ?? 0) > Date.now())
+    if (link.id !== generatedGuestId && (link.pinExpires ?? 0) > Date.now())
       row.append(
         button(
           'Show PIN',
@@ -897,6 +898,7 @@ onClick('another-guest', async () => {
   element('guest-created').hidden = true;
   element('guest-form').hidden = false;
   element<HTMLFormElement>('guest-form').reset();
+  renderGuestLinks();
 });
 
 element('login-form').addEventListener('submit', (event) => {

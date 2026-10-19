@@ -401,8 +401,8 @@ test('small image previews use existing access boundaries and leave original dow
       const bytes = Buffer.from(await response.arrayBuffer());
       assert.ok(bytes.length < original.length);
       const metadata = await sharp(bytes).metadata();
-      assert.equal(metadata.width, 128);
-      assert.equal(metadata.height, 64);
+      assert.equal(metadata.width, 256);
+      assert.equal(metadata.height, 128);
       assert.equal(metadata.exif, undefined);
     }
     const localImage = localRoute.replace('/preview', '/image');
@@ -956,6 +956,75 @@ test('LAN guest proxy URLs preserve PIN access, path-scoped sessions and native 
     );
     await host.guestLinks.revoke(link.id);
     assert.equal((await guest('/guest/catalog', cookie)).statusCode, 401);
+  } finally {
+    await host?.close();
+    await f.close();
+  }
+});
+
+test('proxy-only configuration binds both servers to loopback and rejects missing or non-LAN guest URLs', async (t) => {
+  t.mock.method(os, 'networkInterfaces', () => ({
+    ethernet: [
+      {
+        address: '192.168.50.25',
+        netmask: '255.255.255.0',
+        family: 'IPv4',
+        mac: '00:11:22:33:44:55',
+        internal: false,
+        cidr: '192.168.50.25/24',
+      },
+    ],
+  }));
+  const f = await fixture();
+  let host: Host | undefined;
+  try {
+    await f.host.close();
+    assert.throws(
+      () => new Host(f.store, { proxyOnly: true }),
+      /requires LAN mode and a configured guest URL/,
+    );
+    assert.throws(
+      () =>
+        new Host(f.store, {
+          proxyOnly: true,
+          access: 'tunnel',
+          guestUrl: 'http://guest.home.arpa/apps/p2pfs',
+        }),
+      /requires LAN mode and a configured guest URL/,
+    );
+    await writeFile(
+      path.join(f.store.directory, 'host.json'),
+      JSON.stringify({
+        proxyOnly: true,
+        guestUrl: 'http://guest.home.arpa/apps/p2pfs',
+      }),
+    );
+    const store = await StateStore.open(f.store.directory, password);
+    assert.equal(store.proxyOnly, true);
+    host = new Host(store, { transferPort: 0, managementPort: 0 });
+    await host.listen();
+    for (const server of [host.transfer.server, host.management.server]) {
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      assert.equal(address.address, '127.0.0.1');
+    }
+    assert.equal(host.state().access, 'lan');
+    assert.equal(host.state().proxyOnly, true);
+    const landing = await host.transfer.inject({
+      url: '/apps/p2pfs/',
+      headers: { host: 'guest.home.arpa' },
+    });
+    assert.equal(landing.statusCode, 200);
+    assert.match(landing.body, /id="pin-form">/);
+    assert.equal(
+      (
+        await host.transfer.inject({
+          url: '/apps/p2pfs/guest/catalog',
+          headers: { host: 'guest.home.arpa' },
+        })
+      ).statusCode,
+      401,
+    );
   } finally {
     await host?.close();
     await f.close();
@@ -2058,6 +2127,8 @@ test('host configuration controls provider selection and rejects invalid edits w
       '{"lanAddress":"127.0.0.1"}',
       '{"lanAddress":"8.8.8.8"}',
       '{"guestUrl":null}',
+      '{"proxyOnly":"true"}',
+      '{"proxyOnly":1}',
       '{"guestUrl":"not a URL"}',
       '{"guestUrl":"file:///tmp/guest"}',
       '{"guestUrl":"http://user:password@home.arpa/apps/p2pfs"}',

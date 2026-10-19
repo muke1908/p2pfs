@@ -583,6 +583,123 @@ test(
   },
 );
 
+test(
+  'proxy-only CLI and Mac configuration keep the guest server off the LAN while preserving PIN access',
+  { skip: !lan && 'No private IPv4 network interface is available' },
+  async (t) => {
+    assert.ok(lan);
+    for (const mode of ['flag', 'mac']) {
+      await t.test(mode, async () => {
+        const root = await realpath(
+          await mkdtemp(path.join(os.tmpdir(), 'p2pfs-proxy-only-')),
+        );
+        const transferPort = await availablePort();
+        let managementPort = await availablePort();
+        while (transferPort === managementPort)
+          managementPort = await availablePort();
+        const backend = `http://127.0.0.1:${transferPort}`;
+        const guestUrl = `${backend}/apps/p2pfs`;
+        await writeFile(
+          path.join(root, 'host.json'),
+          JSON.stringify({
+            guestUrl,
+            ...(mode === 'mac' ? { proxyOnly: true } : {}),
+          }),
+        );
+        const child = spawn(
+          process.execPath,
+          [
+            '--import',
+            './dist/test/cli-tunnel-fixture.js',
+            `dist/src/cli/${mode === 'mac' ? 'mac-host' : 'main'}.js`,
+            '--state-dir',
+            root,
+            '--transfer-port',
+            String(transferPort),
+            '--management-port',
+            String(managementPort),
+            ...(mode === 'flag' ? ['--proxy-only', '--password-stdin'] : []),
+          ],
+          {
+            env: { ...process.env, P2PFS_TEST_TUNNEL_FAILURE: '1' },
+            stdio: ['pipe', 'pipe', 'pipe'],
+          },
+        );
+        let output = '';
+        try {
+          await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(
+              () =>
+                reject(new Error(`Proxy-only startup timed out: ${output}`)),
+              10_000,
+            );
+            const ready = (chunk: Buffer) => {
+              output += chunk.toString();
+              if (
+                output.includes(`Proxy backend (loopback only): ${backend}`)
+              ) {
+                clearTimeout(timer);
+                resolve();
+              }
+            };
+            child.stdout.on('data', ready);
+            child.stderr.on('data', ready);
+            child.once('error', (error) => {
+              clearTimeout(timer);
+              reject(error);
+            });
+            child.once('exit', (code) => {
+              clearTimeout(timer);
+              reject(
+                new Error(`Proxy-only publisher exited (${code}): ${output}`),
+              );
+            });
+            if (mode === 'mac') child.stdin.write(`${password}\n`);
+            else child.stdin.end(`${password}\n`);
+          });
+          assert.equal(output.includes('Synthetic tunnel start'), false);
+          const local = await management(`http://127.0.0.1:${managementPort}`);
+          const state = await (await local('/api/state')).json();
+          assert.equal(state.proxyOnly, true);
+          assert.equal(state.access, 'lan');
+          for (const port of [transferPort, managementPort])
+            await assert.rejects(
+              fetch(`http://${lan}:${port}/receive`, {
+                signal: AbortSignal.timeout(2000),
+              }),
+            );
+          assert.equal((await fetch(`${guestUrl}/`)).status, 200);
+          const created = await local('/api/guest-links', 'POST', {
+            label: 'Proxy-only session',
+          });
+          assert.equal(created.status, 200);
+          const link = await created.json();
+          assert.equal(link.joinUrl, `${guestUrl}/receive`);
+          const joined = await fetch(`${guestUrl}/guest/pin`, {
+            method: 'POST',
+            headers: { origin: backend, 'content-type': 'application/json' },
+            body: JSON.stringify({ pin: link.pin }),
+          });
+          assert.equal(joined.status, 200);
+          const setCookie = joined.headers.get('set-cookie')!;
+          assert.match(setCookie, /Path=\/apps\/p2pfs\/guest;/);
+          const catalog = await fetch(`${guestUrl}/guest/catalog`, {
+            headers: { cookie: setCookie.split(';')[0]! },
+          });
+          assert.equal(catalog.status, 200);
+          assert.equal((await catalog.json()).label, 'Proxy-only session');
+        } finally {
+          try {
+            await stop(child);
+          } finally {
+            await rm(root, { recursive: true, force: true });
+          }
+        }
+      });
+    }
+  },
+);
+
 test('default LAN startup fails explicitly without a private interface and never starts a tunnel', async () => {
   const root = await realpath(
     await mkdtemp(path.join(os.tmpdir(), 'p2pfs-no-lan-')),

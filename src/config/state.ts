@@ -56,6 +56,7 @@ async function configuredHost(
   access: Access;
   lanAddress?: string;
   guestUrl?: string;
+  proxyOnly: boolean;
 }> {
   const filename = path.join(directory, 'host.json');
   try {
@@ -84,14 +85,18 @@ async function configuredHost(
     typeof config !== 'object' ||
     Array.isArray(config) ||
     Object.keys(config).some(
-      (key) => !['access', 'provider', 'lanAddress', 'guestUrl'].includes(key),
+      (key) =>
+        !['access', 'provider', 'lanAddress', 'guestUrl', 'proxyOnly'].includes(
+          key,
+        ),
     ) ||
     Object.keys(config).length === 0 ||
     ('lanAddress' in config && typeof config.lanAddress !== 'string') ||
-    ('guestUrl' in config && typeof config.guestUrl !== 'string')
+    ('guestUrl' in config && typeof config.guestUrl !== 'string') ||
+    ('proxyOnly' in config && typeof config.proxyOnly !== 'boolean')
   )
     throw new Error(
-      `Invalid host configuration ${filename}: use "access" ("lan" or "tunnel"), optional "provider" ("ngrok", "devtunnel", or "zrok"), optional "lanAddress" (a private IPv4 address), and optional "guestUrl" (the LAN reverse proxy's HTTP(S) address and path prefix). No other fields are allowed.`,
+      `Invalid host configuration ${filename}: use "access" ("lan" or "tunnel"), optional "provider" ("ngrok", "devtunnel", or "zrok"), optional "lanAddress" (a private IPv4 address), optional "guestUrl" (the LAN reverse proxy's HTTP(S) address and path prefix), and optional "proxyOnly" (a boolean requiring LAN mode and guestUrl). No other fields are allowed.`,
     );
   let access: Access = 'lan';
   if ('access' in config) {
@@ -136,6 +141,7 @@ async function configuredHost(
     access,
     lanAddress: address,
     guestUrl,
+    proxyOnly: 'proxyOnly' in config && config.proxyOnly === true,
   };
 }
 
@@ -147,6 +153,7 @@ export class StateStore {
     readonly lanAddress?: string,
     readonly access: Access = 'lan',
     readonly guestUrl?: string,
+    readonly proxyOnly = false,
   ) {}
 
   static async open(
@@ -198,6 +205,7 @@ export class StateStore {
       config.lanAddress,
       config.access,
       config.guestUrl,
+      config.proxyOnly,
     );
     await store.save();
     return store;
